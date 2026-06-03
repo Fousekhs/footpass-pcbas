@@ -1,0 +1,23 @@
+# Template for the PCBAS / FOOTPASS one-match mirror script.
+#
+# Copy this file to `config.toml` and fill in the empty fields locally.
+# `config.toml` is listed in `.gitignore` so secrets never leave the
+# machine. Do NOT commit real credentials.
+
+[pcbas]
+# Hugging Face dataset that hosts FOOTPASS / SoccerNet PCBAS annotations
+# and metadata. You should not normally need to change this.
+huggingface_repo = "SoccerNet/SN-PCBAS-2026"
+
+# Personal Hugging Face access token (https://huggingface.co/settings/tokens).
+# Required because the dataset is gated: you must also accept its terms
+# on the dataset page while logged in with the same account. Use a
+# read-scoped token.
+huggingface_token = ""
+
+# Password received after signing the SoccerNet NDA. Used to extract
+# password-protected archives (videos and similar restricted material).
+soccernet_password = ""
+
+# Where the mirrored match data will be written, relative to the project root.
+output_dir = "data/pcbas_one_match"

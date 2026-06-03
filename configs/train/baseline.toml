@@ -1,0 +1,74 @@
+# Reusable training defaults for `scripts/train.py`.
+#
+# This file is meant to be committed: copy it to
+# `configs/train/<experiment>.toml`, tweak, and pass via
+# `--train-config configs/train/<experiment>.toml`. CLI flags always
+# override values set here, and any key omitted falls back to the
+# script's built-in default.
+#
+# DO NOT put secrets in this file. The Hugging Face token and SoccerNet
+# password live in the gitignored `config.toml` (see
+# `config.example.toml`). The W&B API key belongs in the `WANDB_API_KEY`
+# environment variable or `wandb login`.
+#
+# Keys recognized below mirror the argparse flags of `scripts/train.py`.
+# Unknown sections or keys abort the run with a clear error.
+
+[train]
+epochs = 5
+batch_size = 4
+learning_rate = 1e-3
+weight_decay = 1e-4
+warmup_steps = 50
+grad_clip = 1.0
+window_size = 128
+stride = 96
+
+# Set to true to disable objectness supervision (objectness_lambda=0).
+no_objectness = false
+
+# Model dims. visual_dim must match the precomputed visual cache; use
+# 384 for DINOv2 ViT-S/14, or leave 0 to train kinematic-only.
+hidden_dim = 64
+num_mstcn_stages = 3
+num_mstcn_layers = 10
+visual_dim = 0
+visual_backbone = "dinov2_vits14"
+
+# Heterogeneous graph extensions (4090-targeted defaults). Zone nodes
+# add a count-aware view of physical congestion; radius edges and the
+# matching degree counts give the embedder a real cardinality signal
+# next to the kNN-censored `near` edge. Set to false to reproduce the
+# pre-zone architecture for ablations.
+use_zone_nodes = true
+zone_grid = "6x4"
+use_jersey = true
+use_goal_distances = true
+use_radius_edges = true
+radius = 0.15
+
+# device and seed are usually per-machine / per-run; uncomment to pin.
+# device = "cuda:0"
+# seed = 42
+
+[validation]
+# Enable per-epoch validation by naming a split from the manifest.
+validation_split = "val"
+# validation_stride defaults to window_size (non-overlapping).
+# validation_stride = 128
+decode_threshold = 0.5
+nms_radius = 12
+nms_mode = "per_player_class"
+# Frame tolerances for average_map_at_tolerances. At 25 fps:
+# 3 frames =~ 120 ms, 12 frames =~ 480 ms, 25 frames =~ 1 s.
+metric_tolerances = [3, 12, 25]
+
+[wandb]
+# Enable W&B tracking without typing --wandb every time. CLI --no-wandb
+# still overrides this when you want a quick local-only run.
+enabled = true
+project = "pcspot"
+# entity = "your-team"  # uncomment to pin a team/username
+tags = ["pcbas", "baseline"]
+# mode = "online"       # one of online | offline | disabled
+log_artifacts = true

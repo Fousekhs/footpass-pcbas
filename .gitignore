@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets
+config.toml
+
+# Data and caches (PCBAS / FOOTPASS broadcasts must never be committed:
+# the SoccerNet NDA forbids redistributing the video material)
+data/
+.cache/
+checkpoints/
+predictions/
+
+# Docs for myself
+docs/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

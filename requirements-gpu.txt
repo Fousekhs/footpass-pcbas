@@ -1,0 +1,24 @@
+# GPU dependency overlay for the pcspot project.
+#
+# requirements.txt pins CPU-only torch / torchvision wheels. On a CUDA
+# machine (e.g. Vast.ai), install the matching CUDA build of PyTorch
+# FIRST, then `pip install -r requirements.txt` will keep the rest of
+# the pins without touching torch / torchvision.
+#
+# Recommended setup (CUDA 12.1, adjust the index URL if the rented
+# instance ships a different CUDA toolkit):
+#
+#   python -m venv .venv
+#   source .venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#
+# After this two-step install, `python -c "import torch; print(torch.cuda.is_available())"`
+# should print True.
+#
+# Versions match those in requirements.txt minus the "+cpu" local tag,
+# so the CUDA wheels resolve cleanly from the PyTorch index.
+
+torch==2.12.0
+torchvision==0.27.0
