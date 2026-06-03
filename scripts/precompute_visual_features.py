@@ -198,6 +198,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=8,
         help="Number of decoded+cropped frames to buffer in the prefetch queue (default: 8).",
     )
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel worker processes (default: 1 = sequential). "
+            "Each worker loads its own DINOv2 instance and processes one "
+            "match-half at a time, so CPU video decoding scales with core "
+            "count. Values of 4-8 are typical; keep below GPU memory limit."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -725,6 +736,113 @@ def _write_run_manifest(
     return target
 
 
+def _build_half_payload(
+    match: "MatchAssets",
+    half_key: str,
+    arr: np.ndarray,
+    split_label: Optional[str],
+    args: argparse.Namespace,
+    metadata: "VisualFeatureMetadata",
+    out_root: Path,
+) -> dict:
+    """Build a serialisable task dict for one match-half."""
+    return {
+        "match_id": match.match_id,
+        "half_id": half_key,
+        "split": split_label,
+        "arr": arr,
+        "video_path": str(match.video_path),
+        "backbone": str(args.backbone),
+        "crop_size": int(args.crop_size),
+        "pad_factor": float(args.pad_factor),
+        "min_box_size": int(args.min_box_size),
+        "batch_size": int(args.batch_size),
+        "device": str(args.device),
+        "use_stub": bool(args.use_stub),
+        "fp16": bool(args.fp16),
+        "compile_model": bool(args.compile),
+        "prefetch_queue_size": int(args.prefetch_queue_size),
+        "start_frame": args.start_frame,
+        "end_frame": args.end_frame,
+        "max_frames": args.max_frames,
+        "out_root": str(out_root),
+        "metadata": metadata.to_dict(),
+    }
+
+
+def _process_half_task(payload: dict) -> dict:
+    """Worker entry point for ProcessPoolExecutor.
+
+    Each worker process independently loads DINOv2 and processes one
+    match-half.  No shared state with the main process; the worker
+    creates its own extractor, cropper, and store.
+    """
+    import argparse as _ap
+    import time as _time
+    from pathlib import Path as _Path
+
+    from pcspot.features.cache import VisualFeatureMetadata, VisualFeatureStore
+    from pcspot.features.cropper import CropperConfig, PaddedPlayerCropper
+    from pcspot.features.dinov2 import DinoV2Config, DinoV2Extractor
+
+    _args = _ap.Namespace(
+        batch_size=payload["batch_size"],
+        crop_size=payload["crop_size"],
+        prefetch_queue_size=payload["prefetch_queue_size"],
+        start_frame=payload.get("start_frame"),
+        end_frame=payload.get("end_frame"),
+        max_frames=payload.get("max_frames"),
+        device=payload["device"],
+    )
+
+    cropper = PaddedPlayerCropper(
+        CropperConfig(
+            crop_size=payload["crop_size"],
+            pad_factor=payload["pad_factor"],
+            min_box_size=payload["min_box_size"],
+        )
+    )
+    metadata = VisualFeatureMetadata.from_dict(payload["metadata"])
+    dino_cfg = DinoV2Config(
+        backbone_name=payload["backbone"],
+        crop_size=payload["crop_size"],
+        device=payload["device"],
+        use_stub=payload["use_stub"],
+        batch_size=payload["batch_size"],
+        fp16=payload["fp16"],
+        compile_model=payload["compile_model"],
+        # Use the store's feature_dim so stub / custom backbones match.
+        feature_dim=metadata.feature_dim,
+    )
+    extractor = DinoV2Extractor(dino_cfg)
+    store = VisualFeatureStore(_Path(payload["out_root"]), metadata=metadata)
+
+    t0 = _time.perf_counter()
+    n = precompute_for_half(
+        match_id=payload["match_id"],
+        half_id=payload["half_id"],
+        arr=payload["arr"],
+        video_path=_Path(payload["video_path"]),
+        cropper=cropper,
+        extractor=extractor,
+        store=store,
+        args=_args,
+        wandb_run=None,
+    )
+    elapsed = _time.perf_counter() - t0
+    written = store.flush()
+    return {
+        "match_id": payload["match_id"],
+        "half_id": payload["half_id"],
+        "split": payload.get("split"),
+        "status": "written",
+        "frames": int(n),
+        "elapsed_s": elapsed,
+        "fps": n / elapsed if elapsed > 0 else 0.0,
+        "shards": [str(p) for p in written],
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = PCBASConfig.load(args.config)
@@ -767,7 +885,6 @@ def main(argv: list[str] | None = None) -> int:
     metadata: Optional[VisualFeatureMetadata] = None
 
     if not args.dry_run:
-        cropper = PaddedPlayerCropper(cropper_cfg)
         from pcspot.features.dinov2 import DinoV2Config, DinoV2Extractor
 
         dino_cfg = DinoV2Config(
@@ -779,16 +896,25 @@ def main(argv: list[str] | None = None) -> int:
             fp16=bool(args.fp16),
             compile_model=bool(args.compile),
         )
-        extractor = DinoV2Extractor(dino_cfg)
+        if args.num_workers <= 1:
+            # Sequential: load the model once in the main process.
+            cropper = PaddedPlayerCropper(cropper_cfg)
+            extractor = DinoV2Extractor(dino_cfg)
+            feature_dim = extractor.feature_dim
+        else:
+            # Parallel: workers load their own models; use the configured
+            # feature_dim so we can build metadata without loading weights.
+            feature_dim = dino_cfg.feature_dim
         metadata = VisualFeatureMetadata(
             backbone_name=dino_cfg.backbone_name + ("_stub" if args.use_stub else ""),
-            feature_dim=extractor.feature_dim,
+            feature_dim=feature_dim,
             crop_size=cropper_cfg.crop_size,
             pad_factor=cropper_cfg.pad_factor,
             fullhd_width=cropper_cfg.fullhd_width,
             fullhd_height=cropper_cfg.fullhd_height,
         )
-        store = VisualFeatureStore(out_root, metadata=metadata)
+        if args.num_workers <= 1:
+            store = VisualFeatureStore(out_root, metadata=metadata)
     else:
         # Build a metadata stub so the dry-run manifest still records
         # the requested backbone / crop config.
@@ -818,6 +944,7 @@ def main(argv: list[str] | None = None) -> int:
                 "fp16": args.fp16,
                 "compile": args.compile,
                 "prefetch_queue_size": args.prefetch_queue_size,
+                "num_workers": args.num_workers,
                 "splits": splits,
                 "n_matches": len(pairs),
                 "out_dir": str(out_root),
@@ -832,6 +959,10 @@ def main(argv: list[str] | None = None) -> int:
     records: list[dict] = []
     total_frames = 0
     global_step: list[int] = [0]
+
+    # Build a flat task list, handling missing videos, dry-run, and
+    # skip-existing in one pass regardless of the execution mode.
+    half_tasks: list[dict] = []
     for split_label, match in pairs:
         if not match.video_path.exists():
             print(f"[{match.match_id}] video missing ({match.video_path}); skipping")
@@ -858,7 +989,6 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         arrays = load_tactical_arrays(match)
-        assert store is not None and cropper is not None and extractor is not None
         for half_key, arr in arrays.items():
             if skip_existing and _shard_exists(backbone_root, match.match_id, half_key):
                 print(f"[{match.match_id}/{half_key}] cache shard exists; skipping")
@@ -872,31 +1002,84 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
                 continue
-            n = precompute_for_half(
-                match_id=match.match_id,
-                half_id=half_key,
-                arr=arr,
-                video_path=match.video_path,
-                cropper=cropper,
-                extractor=extractor,
-                store=store,
-                args=args,
-                wandb_run=wandb_run,
-                global_step=global_step,
+            half_tasks.append(
+                _build_half_payload(match, half_key, arr, split_label, args, metadata, out_root)
             )
-            print(f"[{match.match_id}/{half_key}] processed {n} frames")
-            total_frames += n
-            written = store.flush()
-            records.append(
-                {
-                    "match_id": match.match_id,
-                    "half_id": half_key,
-                    "split": split_label,
-                    "status": "written",
-                    "frames": int(n),
-                    "shards": [str(p) for p in written],
+
+    if half_tasks and not args.dry_run:
+        if args.num_workers <= 1:
+            assert store is not None and cropper is not None and extractor is not None
+            for task in half_tasks:
+                n = precompute_for_half(
+                    match_id=task["match_id"],
+                    half_id=task["half_id"],
+                    arr=task["arr"],
+                    video_path=Path(task["video_path"]),
+                    cropper=cropper,
+                    extractor=extractor,
+                    store=store,
+                    args=args,
+                    wandb_run=wandb_run,
+                    global_step=global_step,
+                )
+                print(f"[{task['match_id']}/{task['half_id']}] processed {n} frames")
+                total_frames += n
+                written = store.flush()
+                records.append(
+                    {
+                        "match_id": task["match_id"],
+                        "half_id": task["half_id"],
+                        "split": task["split"],
+                        "status": "written",
+                        "frames": int(n),
+                        "shards": [str(p) for p in written],
+                    }
+                )
+        else:
+            import multiprocessing as _mp
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+
+            print(f"Workers    : {args.num_workers} parallel ({len(half_tasks)} halves queued)")
+            ctx = _mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=args.num_workers, mp_context=ctx) as pool:
+                future_map = {
+                    pool.submit(_process_half_task, task): task for task in half_tasks
                 }
-            )
+                completed = 0
+                for future in as_completed(future_map):
+                    completed += 1
+                    task = future_map[future]
+                    try:
+                        result = future.result()
+                        total_frames += result["frames"]
+                        print(
+                            f"[{result['match_id']}/{result['half_id']}] "
+                            f"{result['frames']} frames @ {result['fps']:.1f} fps "
+                            f"({completed}/{len(half_tasks)})"
+                        )
+                        records.append(result)
+                        if wandb_run is not None:
+                            wandb_run.log(
+                                {
+                                    "half/frames_processed": result["frames"],
+                                    "half/elapsed_s": result["elapsed_s"],
+                                    "half/fps": result["fps"],
+                                    "match_id": result["match_id"],
+                                    "half_id": result["half_id"],
+                                },
+                                step=completed,
+                            )
+                    except Exception as exc:
+                        print(f"[{task['match_id']}/{task['half_id']}] ERROR: {exc}")
+                        records.append(
+                            {
+                                "match_id": task["match_id"],
+                                "half_id": task["half_id"],
+                                "split": task.get("split"),
+                                "status": "error",
+                                "error": str(exc),
+                            }
+                        )
 
     manifest_path = _write_run_manifest(
         out_root, args=args, metadata=metadata, records=records

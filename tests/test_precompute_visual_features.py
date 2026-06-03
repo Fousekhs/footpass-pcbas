@@ -180,11 +180,16 @@ class ParseArgsNewFlagsTests(unittest.TestCase):
         args = pvf.parse_args(["--config", "config.toml", "--prefetch-queue-size", "4"])
         self.assertEqual(args.prefetch_queue_size, 4)
 
+    def test_num_workers_accepted(self) -> None:
+        args = pvf.parse_args(["--config", "config.toml", "--num-workers", "4"])
+        self.assertEqual(args.num_workers, 4)
+
     def test_defaults(self) -> None:
         args = pvf.parse_args(["--config", "config.toml"])
         self.assertFalse(args.fp16)
         self.assertFalse(args.compile)
         self.assertEqual(args.prefetch_queue_size, 8)
+        self.assertEqual(args.num_workers, 1)
 
 
 class PrefetchDecodeWorkerTests(unittest.TestCase):
@@ -231,6 +236,78 @@ class PrefetchDecodeWorkerTests(unittest.TestCase):
         self.assertEqual(len(items), 3)
         self.assertEqual([it["frame"] for it in items], [0, 1, 2])
         self.assertTrue(all(it["n_valid"] == 0 for it in items))
+
+
+class ProcessHalfTaskTests(unittest.TestCase):
+    """Exercise _process_half_task (the parallel worker) directly."""
+
+    def test_worker_produces_shard(self) -> None:
+        import argparse
+        from tempfile import TemporaryDirectory
+        import numpy as np
+
+        from pcspot.features.cache import VisualFeatureMetadata
+
+        with TemporaryDirectory() as tmp:
+            out_root = Path(tmp) / "cache"
+
+            # Tiny synthetic tactical array: 4 frames × 2 players, 14 columns.
+            # Columns: frame, player_id, l2r, shirt, role, x, y, sx, sy,
+            #           roi_x, roi_y, roi_w, roi_h, class
+            rows = []
+            for frame in range(4):
+                for pid in [101, 102]:
+                    rows.append([
+                        frame, pid, 1.0, 1, 1,
+                        0.5, 0.5, 0.0, 0.0,
+                        200.0, 200.0, 80.0, 160.0,
+                        0.0,
+                    ])
+            arr = np.array(rows, dtype=np.float32)
+
+            metadata = VisualFeatureMetadata(
+                backbone_name="dinov2_vits14_stub",
+                feature_dim=8,
+                crop_size=32,
+                pad_factor=1.6,
+                fullhd_width=1920,
+                fullhd_height=1080,
+            )
+
+            payload = {
+                "match_id": "game_test",
+                "half_id": "game_test_H1",
+                "split": "TRAIN",
+                "arr": arr,
+                "video_path": "irrelevant.mp4",
+                "backbone": "dinov2_vits14",
+                "crop_size": 32,
+                "pad_factor": 1.6,
+                "min_box_size": 8,
+                "batch_size": 8,
+                "device": "cpu",
+                "use_stub": True,
+                "fp16": False,
+                "compile_model": False,
+                "prefetch_queue_size": 2,
+                "start_frame": None,
+                "end_frame": None,
+                "max_frames": None,
+                "out_root": str(out_root),
+                "metadata": metadata.to_dict(),
+            }
+
+            # Patch video reading so the worker doesn't need a real file.
+            fake_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+            with mock.patch.object(pvf, "_open_video", return_value=mock.MagicMock()), \
+                 mock.patch.object(pvf, "_seek"), \
+                 mock.patch.object(pvf, "_read_frame_bgr_to_rgb",
+                                   side_effect=[fake_frame] * 4 + [None]):
+                result = pvf._process_half_task(payload)
+
+            self.assertEqual(result["status"], "written")
+            self.assertEqual(result["frames"], 4)
+            self.assertGreater(len(result["shards"]), 0)
 
 
 class MainDryRunTests(unittest.TestCase):
