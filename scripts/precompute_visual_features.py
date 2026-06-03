@@ -556,21 +556,8 @@ def precompute_for_half(
             n_with_crops = max(1, len(entries_with_crops))
             base_step = global_step[0] - n_frames
 
-            wandb_run.log(
-                {
-                    "batch/n_crops": total_crops,
-                    "batch/n_frames": n_frames,
-                    "batch/fill_frac": fill_frac,
-                    "batch/infer_ms": t_infer_total * 1e3,
-                    "batch/crops_per_sec": (
-                        total_crops / t_infer_total if t_infer_total > 0 else 0.0
-                    ),
-                    "match_id": match_id,
-                    "half_id": half_id,
-                },
-                step=global_step[0],
-            )
-
+            # Per-frame metrics must be logged in step order BEFORE the
+            # batch summary, otherwise W&B rejects the lower step numbers.
             for i, p in enumerate(pending):
                 n_v = p["n_valid"]
                 t_infer_approx = (
@@ -597,6 +584,23 @@ def precompute_for_half(
                     },
                     step=base_step + i + 1,
                 )
+
+            # Batch summary lands at the same step as the last frame so it
+            # is merged into that step rather than creating a new one.
+            wandb_run.log(
+                {
+                    "batch/n_crops": total_crops,
+                    "batch/n_frames": n_frames,
+                    "batch/fill_frac": fill_frac,
+                    "batch/infer_ms": t_infer_total * 1e3,
+                    "batch/crops_per_sec": (
+                        total_crops / t_infer_total if t_infer_total > 0 else 0.0
+                    ),
+                    "match_id": match_id,
+                    "half_id": half_id,
+                },
+                step=global_step[0],
+            )
 
         pending.clear()
         pending_crop_count = 0
