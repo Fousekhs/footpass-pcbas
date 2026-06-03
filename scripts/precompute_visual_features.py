@@ -406,28 +406,149 @@ def _frame_iter(arr: np.ndarray) -> Iterable[tuple[int, np.ndarray]]:
         yield int(f), arr[lo:hi]
 
 
-def _open_video(video_path: Path):
+class _VideoReader:
+    """Backend-agnostic video reader that yields (H, W, 3) uint8 RGB frames."""
+
+    def read_rgb(self) -> np.ndarray | None:
+        """Return the next frame as RGB, or ``None`` at end-of-stream."""
+        raise NotImplementedError
+
+    def seek(self, frame_n: int) -> None:
+        """Position the stream so the next ``read_rgb()`` returns frame *frame_n*."""
+        raise NotImplementedError
+
+    def release(self) -> None:
+        raise NotImplementedError
+
+
+class _Cv2VideoReader(_VideoReader):
+    """Software-decode backend via ``cv2.VideoCapture``."""
+
+    def __init__(self, path: str) -> None:
+        import cv2 as _cv2
+
+        self._cap = _cv2.VideoCapture(path)
+        if not self._cap.isOpened():
+            raise OSError(f"Cannot open video: {path}")
+        self._cv2 = _cv2
+
+    def read_rgb(self) -> np.ndarray | None:
+        ok, frame = self._cap.read()
+        if not ok or frame is None:
+            return None
+        return self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+
+    def seek(self, frame_n: int) -> None:
+        self._cap.set(self._cv2.CAP_PROP_POS_FRAMES, int(frame_n))
+
+    def release(self) -> None:
+        self._cap.release()
+
+
+class _PyAvVideoReader(_VideoReader):
+    """Hardware-decode backend via PyAV + NVDEC (falls back to sw-decode).
+
+    Install with: ``pip install av``
+
+    FFmpeg must be compiled with ``--enable-nvdec`` (true for most
+    system packages on NVIDIA Linux hosts).  If NVDEC is unavailable the
+    constructor retries without ``hwaccel`` so the reader always works.
+    """
+
+    def __init__(self, path: str, hwaccel: str | None = "cuda") -> None:
+        import av as _av
+
+        self._av = _av
+        self._hwaccel = hwaccel
+        options: dict = {"hwaccel": hwaccel} if hwaccel else {}
+        try:
+            self._container = _av.open(path, options=options or None)
+        except Exception:
+            # Hardware decode not available — retry without it.
+            self._hwaccel = None
+            self._container = _av.open(path)
+
+        streams = self._container.streams.video
+        if not streams:
+            raise OSError(f"No video stream in: {path}")
+        self._stream = streams[0]
+        self._stream.thread_type = "AUTO"
+        _rate = self._stream.average_rate
+        self._fps: float = float(_rate) if _rate else 25.0
+        _tb = self._stream.time_base
+        self._tb: float = float(_tb) if _tb else 1.0 / 90000.0
+        self._iter = self._container.decode(self._stream)
+        self._peeked: np.ndarray | None = None  # frame buffered during seek
+
+    def read_rgb(self) -> np.ndarray | None:
+        if self._peeked is not None:
+            frame, self._peeked = self._peeked, None
+            return frame
+        try:
+            return next(self._iter).to_ndarray(format="rgb24")
+        except StopIteration:
+            return None
+
+    def _pts_to_frame(self, pts: int | None) -> int:
+        if pts is None:
+            return -1
+        return max(0, int(pts * self._tb * self._fps + 0.5))
+
+    def seek(self, frame_n: int) -> None:
+        target_pts = int(frame_n / self._fps / self._tb)
+        # backward=True → land on the nearest keyframe at or before target
+        self._container.seek(target_pts, stream=self._stream, backward=True)
+        self._iter = self._container.decode(self._stream)
+        self._peeked = None
+        # Fast-forward to the exact target frame (keyframe may be earlier)
+        for av_frame in self._iter:
+            if self._pts_to_frame(av_frame.pts) >= frame_n:
+                self._peeked = av_frame.to_ndarray(format="rgb24")
+                return
+
+    def release(self) -> None:
+        try:
+            self._container.close()
+        except Exception:
+            pass
+
+
+def _open_video(video_path: Path) -> _VideoReader:
+    """Open *video_path* with the best available backend.
+
+    Priority order:
+    1. PyAV + NVDEC hardware decode  (requires ``pip install av``)
+    2. PyAV software decode          (requires ``pip install av``)
+    3. cv2 software decode           (always available)
+    """
+    path = str(video_path)
+    try:
+        import av as _av  # noqa: F401
+
+        reader = _PyAvVideoReader(path, hwaccel="cuda")
+        _hw = "NVDEC" if reader._hwaccel else "sw"
+        print(f"[video] PyAV backend ({_hw}): {video_path.name}", flush=True)
+        return reader
+    except Exception:
+        pass
     import cv2
 
-    cap = cv2.VideoCapture(str(video_path))
+    cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise SystemExit(f"Could not open video: {video_path}")
-    return cap
+    reader_cv2 = _Cv2VideoReader.__new__(_Cv2VideoReader)
+    reader_cv2._cap = cap
+    reader_cv2._cv2 = cv2
+    return reader_cv2
 
 
-def _seek(cap, frame_index: int) -> None:
-    import cv2
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+def _seek(reader: _VideoReader, frame_index: int) -> None:
+    reader.seek(frame_index)
 
 
-def _read_frame_bgr_to_rgb(cap) -> np.ndarray | None:
-    import cv2
-
-    ok, frame = cap.read()
-    if not ok:
-        return None
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+def _read_frame_bgr_to_rgb(reader: _VideoReader) -> np.ndarray | None:
+    # Name kept for backward compat with tests; always returns RGB regardless of backend.
+    return reader.read_rgb()
 
 
 def _resolve_frame_range(
