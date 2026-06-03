@@ -221,8 +221,17 @@ class DinoV2Extractor:
             device_type=_device_type, enabled=_use_amp
         ):
             for i in range(0, crops.shape[0], bs):
-                batch = self._preprocess(crops[i : i + bs])
+                batch_crops = crops[i : i + bs]
+                n_actual = batch_crops.shape[0]
+                if n_actual < bs:
+                    # Pad the last (partial) batch to a fixed size so
+                    # torch.compile / CUDA graphs never see a new input
+                    # shape and do not trigger an expensive re-capture.
+                    pad = np.repeat(batch_crops[-1:], bs - n_actual, axis=0)
+                    batch_crops = np.concatenate([batch_crops, pad], axis=0)
+                batch = self._preprocess(batch_crops)
                 feats = self._backbone(batch)
+                feats = feats[:n_actual]  # drop the padding rows
                 if feats.ndim != 2:
                     raise ValueError(
                         f"backbone returned shape {tuple(feats.shape)}; "
