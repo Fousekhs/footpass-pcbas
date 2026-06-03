@@ -17,13 +17,10 @@ config.toml
 
 # Data and caches (PCBAS / FOOTPASS broadcasts must never be committed:
 # the SoccerNet NDA forbids redistributing the video material)
-data/
+/data/
 .cache/
 checkpoints/
 predictions/
-
-# Docs for myself
-docs/
 
 # Editors / OS
 .vscode/
