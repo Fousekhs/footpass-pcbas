@@ -679,7 +679,11 @@ def precompute_for_half(
         worker.join()
 
         half_elapsed = time.perf_counter() - half_start
-        if wandb_run is not None and processed > 0:
+
+        # Build aggregate stats unconditionally so the parallel path can
+        # return them to the main process for W&B logging there.
+        half_stats: dict = {}
+        if processed > 0:
             gpu_mem_alloc = gpu_mem_peak = 0.0
             if "cuda" in str(args.device):
                 import torch as _torch
@@ -691,28 +695,32 @@ def precompute_for_half(
                 sum(batch_fill_fracs) / len(batch_fill_fracs)
                 if batch_fill_fracs else 0.0
             )
-            wandb_run.log(
-                {
-                    "half/frames_processed": processed,
-                    "half/elapsed_s": half_elapsed,
-                    "half/fps": processed / half_elapsed if half_elapsed > 0 else 0.0,
-                    "half/read_frac": half_t_read / half_elapsed,
-                    "half/crop_frac": half_t_crop / half_elapsed,
-                    "half/infer_frac": half_t_infer / half_elapsed,
-                    "half/store_frac": half_t_store / half_elapsed,
-                    "half/infer_ms_per_frame": half_t_infer / processed * 1e3,
-                    "half/queue_stalls": queue_stalls,
-                    "half/queue_wait_frac": half_t_queue_wait / half_elapsed,
-                    "half/avg_batch_fill_frac": avg_fill,
-                    "half/gpu_memory_alloc_mb": gpu_mem_alloc,
-                    "half/gpu_memory_peak_mb": gpu_mem_peak,
-                    "match_id": match_id,
-                    "half_id": half_id,
-                },
-                step=global_step[0],
-            )
+            half_stats = {
+                "half/frames_processed": processed,
+                "half/elapsed_s": half_elapsed,
+                "half/fps": processed / half_elapsed if half_elapsed > 0 else 0.0,
+                "half/read_ms_mean": half_t_read / processed * 1e3,
+                "half/crop_ms_mean": half_t_crop / processed * 1e3,
+                "half/infer_ms_mean": half_t_infer / processed * 1e3,
+                "half/store_ms_mean": half_t_store / processed * 1e3,
+                "half/read_frac": half_t_read / half_elapsed,
+                "half/crop_frac": half_t_crop / half_elapsed,
+                "half/infer_frac": half_t_infer / half_elapsed,
+                "half/store_frac": half_t_store / half_elapsed,
+                "half/queue_stalls": queue_stalls,
+                "half/queue_wait_frac": half_t_queue_wait / half_elapsed,
+                "half/avg_batch_fill_frac": avg_fill,
+                "half/gpu_memory_alloc_mb": gpu_mem_alloc,
+                "half/gpu_memory_peak_mb": gpu_mem_peak,
+            }
 
-        return processed
+            if wandb_run is not None:
+                wandb_run.log(
+                    {**half_stats, "match_id": match_id, "half_id": half_id},
+                    step=global_step[0],
+                )
+
+        return processed, half_stats
     finally:
         if worker is not None and worker.is_alive():
             try:
@@ -842,7 +850,7 @@ def _process_half_task(payload: dict) -> dict:
     store = VisualFeatureStore(_Path(payload["out_root"]), metadata=metadata)
 
     t0 = _time.perf_counter()
-    n = precompute_for_half(
+    n, half_stats = precompute_for_half(
         match_id=payload["match_id"],
         half_id=payload["half_id"],
         arr=payload["arr"],
@@ -864,6 +872,7 @@ def _process_half_task(payload: dict) -> dict:
         "elapsed_s": elapsed,
         "fps": n / elapsed if elapsed > 0 else 0.0,
         "shards": [str(p) for p in written],
+        "stats": half_stats,
     }
 
 
@@ -1034,7 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.num_workers <= 1:
             assert store is not None and cropper is not None and extractor is not None
             for task in half_tasks:
-                n = precompute_for_half(
+                n, _half_stats = precompute_for_half(
                     match_id=task["match_id"],
                     half_id=task["half_id"],
                     arr=task["arr"],
@@ -1064,6 +1073,12 @@ def main(argv: list[str] | None = None) -> int:
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
             print(f"Workers    : {args.num_workers} parallel ({len(half_tasks)} halves queued)")
+            if args.num_workers > 1 and str(args.device).startswith("cuda"):
+                print(
+                    f"WARNING: {args.num_workers} workers all targeting {args.device}. "
+                    "Multiple CUDA contexts on the same GPU serialize on the hardware "
+                    "scheduler — consider --num-workers 1 or 2 for single-GPU runs."
+                )
             ctx = _mp.get_context("spawn")
             with ProcessPoolExecutor(max_workers=args.num_workers, mp_context=ctx) as pool:
                 future_map = {
@@ -1083,11 +1098,13 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         records.append(result)
                         if wandb_run is not None:
+                            # Log the full per-half aggregate stats returned by the
+                            # worker (crop_ms_mean, infer_ms_mean, etc.) alongside
+                            # the match/half identifiers.
+                            half_stats = result.get("stats", {})
                             wandb_run.log(
                                 {
-                                    "half/frames_processed": result["frames"],
-                                    "half/elapsed_s": result["elapsed_s"],
-                                    "half/fps": result["fps"],
+                                    **half_stats,
                                     "match_id": result["match_id"],
                                     "half_id": result["half_id"],
                                 },
