@@ -37,6 +37,13 @@ import time
 from pathlib import Path
 from typing import Iterable, Optional
 
+try:
+    import wandb as _wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _wandb = None  # type: ignore[assignment]
+    _WANDB_AVAILABLE = False
+
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -155,6 +162,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Discover matches and report what would be processed without "
             "loading the DINOv2 backbone or reading video frames."
         ),
+    )
+    p.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable Weights & Biases logging even if wandb is installed.",
+    )
+    p.add_argument(
+        "--wandb-project",
+        type=str,
+        default="pcspot-features",
+        help="W&B project name (default: pcspot-features).",
+    )
+    p.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Optional W&B run name.",
     )
     return p.parse_args(argv)
 
@@ -376,6 +400,8 @@ def precompute_for_half(
     extractor,
     store: VisualFeatureStore,
     args: argparse.Namespace,
+    wandb_run=None,
+    global_step: list[int] | None = None,
 ) -> int:
     """Process one match-half. Returns number of frames processed."""
     if arr.size == 0:
@@ -385,24 +411,46 @@ def precompute_for_half(
     if end_frame < start_frame:
         return 0
 
+    if global_step is None:
+        global_step = [0]
+
     cap = _open_video(video_path)
     try:
         _seek(cap, start_frame)
         processed = 0
         cur_frame = start_frame
-        # Pre-index by frame for direct lookups.
         by_frame = {f: rows for f, rows in _frame_iter(arr)}
+
+        half_t_read = half_t_crop = half_t_infer = half_t_store = 0.0
+        half_start = time.perf_counter()
+
         while cur_frame <= end_frame:
+            t0 = time.perf_counter()
             frame = _read_frame_bgr_to_rgb(cap)
+            t_read = time.perf_counter() - t0
             if frame is None:
                 break
+
+            t_crop = t_infer = t_store = 0.0
+            n_players = n_valid = 0
+
             rows = by_frame.get(int(cur_frame))
             if rows is not None and rows.shape[0] > 0:
+                n_players = rows.shape[0]
                 rois = rows[:, [COL["roi_x"], COL["roi_y"], COL["roi_width"], COL["roi_height"]]]
                 pids = rows[:, COL["player_id"]].astype(np.int64)
+
+                t0 = time.perf_counter()
                 crops, mask = cropper.extract(frame, rois)
+                t_crop = time.perf_counter() - t0
+
                 if mask.any():
+                    n_valid = int(mask.sum())
+                    t0 = time.perf_counter()
                     feats = extractor.extract_features(crops[mask])
+                    t_infer = time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
                     visible_pids = pids[mask].tolist()
                     store.add_frame(
                         match_id=match_id,
@@ -412,8 +460,57 @@ def precompute_for_half(
                         features=feats,
                         visible=[True] * feats.shape[0],
                     )
+                    t_store = time.perf_counter() - t0
+
+            half_t_read += t_read
+            half_t_crop += t_crop
+            half_t_infer += t_infer
+            half_t_store += t_store
+
             processed += 1
+            global_step[0] += 1
+
+            if wandb_run is not None:
+                t_frame_total = t_read + t_crop + t_infer + t_store
+                wandb_run.log(
+                    {
+                        "frame/read_ms": t_read * 1e3,
+                        "frame/crop_ms": t_crop * 1e3,
+                        "frame/infer_ms": t_infer * 1e3,
+                        "frame/store_ms": t_store * 1e3,
+                        "frame/total_ms": t_frame_total * 1e3,
+                        "frame/players_tracked": n_players,
+                        "frame/players_valid": n_valid,
+                        "frame/valid_crop_frac": (
+                            n_valid / n_players if n_players > 0 else 0.0
+                        ),
+                        "frame/index": int(cur_frame),
+                        "match_id": match_id,
+                        "half_id": half_id,
+                    },
+                    step=global_step[0],
+                )
+
             cur_frame += 1
+
+        half_elapsed = time.perf_counter() - half_start
+        if wandb_run is not None and processed > 0:
+            wandb_run.log(
+                {
+                    "half/frames_processed": processed,
+                    "half/elapsed_s": half_elapsed,
+                    "half/fps": processed / half_elapsed if half_elapsed > 0 else 0.0,
+                    "half/read_frac": half_t_read / half_elapsed,
+                    "half/crop_frac": half_t_crop / half_elapsed,
+                    "half/infer_frac": half_t_infer / half_elapsed,
+                    "half/store_frac": half_t_store / half_elapsed,
+                    "half/infer_ms_per_frame": half_t_infer / processed * 1e3,
+                    "match_id": match_id,
+                    "half_id": half_id,
+                },
+                step=global_step[0],
+            )
+
         return processed
     finally:
         cap.release()
@@ -529,9 +626,34 @@ def main(argv: list[str] | None = None) -> int:
             fullhd_height=cropper_cfg.fullhd_height,
         )
 
+    use_wandb = _WANDB_AVAILABLE and not args.no_wandb and not args.dry_run
+    wandb_run = None
+    if use_wandb:
+        wandb_run = _wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "backbone": args.backbone,
+                "crop_size": args.crop_size,
+                "pad_factor": args.pad_factor,
+                "min_box_size": args.min_box_size,
+                "batch_size": args.batch_size,
+                "device": args.device,
+                "use_stub": args.use_stub,
+                "splits": splits,
+                "n_matches": len(pairs),
+                "out_dir": str(out_root),
+            },
+            tags=[args.backbone] + ([f"split:{s}" for s in splits] if splits else []),
+        )
+        print(f"W&B run: {wandb_run.url}")
+    elif not _WANDB_AVAILABLE and not args.no_wandb:
+        print("wandb not installed — skipping W&B logging. Install with: pip install wandb")
+
     backbone_root = out_root / metadata.backbone_name
     records: list[dict] = []
     total_frames = 0
+    global_step: list[int] = [0]
     for split_label, match in pairs:
         if not match.video_path.exists():
             print(f"[{match.match_id}] video missing ({match.video_path}); skipping")
@@ -581,6 +703,8 @@ def main(argv: list[str] | None = None) -> int:
                 extractor=extractor,
                 store=store,
                 args=args,
+                wandb_run=wandb_run,
+                global_step=global_step,
             )
             print(f"[{match.match_id}/{half_key}] processed {n} frames")
             total_frames += n
@@ -607,6 +731,14 @@ def main(argv: list[str] | None = None) -> int:
             f"Done. Wrote shards under {backbone_root} "
             f"({total_frames} new frames; {len(records)} records)"
         )
+
+    if wandb_run is not None:
+        wandb_run.summary["total_frames"] = total_frames
+        wandb_run.summary["total_shards"] = len(
+            [r for r in records if r.get("status") == "written"]
+        )
+        wandb_run.finish()
+
     return 0
 
 
