@@ -131,16 +131,21 @@ def pad_and_clamp_box(
 def _resize_crop(crop: np.ndarray, size: int) -> np.ndarray:
     """Resize ``crop`` (H, W, 3) uint8 to ``size x size`` via bilinear.
 
-    Implemented with numpy so the package does not require OpenCV at
-    import time. For training-scale extraction callers should provide
-    OpenCV-resized arrays; this fallback is only used for tests and
-    very small extraction jobs.
+    Uses cv2.resize when OpenCV is available (~0.2 ms/call). Falls back
+    to a pure-NumPy implementation for environments without OpenCV (tests,
+    machines without the binary wheel).
     """
     src_h, src_w = crop.shape[:2]
     if src_h == size and src_w == size:
         return crop
     if src_h == 0 or src_w == 0:
         return np.zeros((size, size, crop.shape[2]), dtype=crop.dtype)
+    try:
+        import cv2 as _cv2
+        return _cv2.resize(crop, (size, size), interpolation=_cv2.INTER_LINEAR)
+    except ImportError:
+        pass
+    # NumPy fallback — ~11 ms/call; only for environments without OpenCV.
     # Generate sample coordinates centered in each output pixel.
     ys = (np.arange(size) + 0.5) * (src_h / size) - 0.5
     xs = (np.arange(size) + 0.5) * (src_w / size) - 0.5
