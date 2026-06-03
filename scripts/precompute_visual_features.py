@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue as _queue
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable, Optional
@@ -179,6 +181,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional W&B run name.",
+    )
+    p.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Run DINOv2 inference under torch.autocast fp16 (CUDA only; ignored on CPU).",
+    )
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="JIT-compile the DINOv2 backbone with torch.compile(mode='reduce-overhead').",
+    )
+    p.add_argument(
+        "--prefetch-queue-size",
+        type=int,
+        default=8,
+        help="Number of decoded+cropped frames to buffer in the prefetch queue (default: 8).",
     )
     return p.parse_args(argv)
 
@@ -390,6 +408,70 @@ def _resolve_frame_range(
     return start, end
 
 
+def _prefetch_decode_crop(
+    cap,
+    by_frame: dict,
+    cropper: "PaddedPlayerCropper",
+    start_frame: int,
+    end_frame: int,
+    out_queue: "_queue.Queue",
+) -> None:
+    """Background worker: decode frames and crop players, push results to *out_queue*.
+
+    Runs on a dedicated thread so video decoding and cropping overlap with
+    GPU inference on the main thread.  A ``None`` sentinel is always emitted
+    last (even on error) so the consumer can detect EOF.  Exceptions are
+    forwarded as queue items before the sentinel.
+    """
+    try:
+        cur_frame = start_frame
+        while cur_frame <= end_frame:
+            t0 = time.perf_counter()
+            frame = _read_frame_bgr_to_rgb(cap)
+            t_read = time.perf_counter() - t0
+            if frame is None:
+                break
+
+            t_crop = 0.0
+            n_players = n_valid = 0
+            crops_valid: np.ndarray = np.empty((0,), dtype=np.uint8)
+            pids_valid: list[int] = []
+
+            rows = by_frame.get(int(cur_frame))
+            if rows is not None and rows.shape[0] > 0:
+                n_players = rows.shape[0]
+                rois = rows[
+                    :, [COL["roi_x"], COL["roi_y"], COL["roi_width"], COL["roi_height"]]
+                ]
+                pids = rows[:, COL["player_id"]].astype(np.int64)
+
+                t0 = time.perf_counter()
+                crops, mask = cropper.extract(frame, rois)
+                t_crop = time.perf_counter() - t0
+
+                if mask.any():
+                    n_valid = int(mask.sum())
+                    crops_valid = crops[mask]
+                    pids_valid = pids[mask].tolist()
+
+            out_queue.put(
+                {
+                    "frame": int(cur_frame),
+                    "pids": pids_valid,
+                    "crops": crops_valid,
+                    "n_players": n_players,
+                    "n_valid": n_valid,
+                    "t_read": t_read,
+                    "t_crop": t_crop,
+                }
+            )
+            cur_frame += 1
+    except BaseException as exc:
+        out_queue.put(exc)
+    finally:
+        out_queue.put(None)
+
+
 def precompute_for_half(
     *,
     match_id: str,
@@ -403,7 +485,11 @@ def precompute_for_half(
     wandb_run=None,
     global_step: list[int] | None = None,
 ) -> int:
-    """Process one match-half. Returns number of frames processed."""
+    """Process one match-half. Returns number of frames processed.
+
+    Video decoding and player cropping run on a dedicated background thread
+    (prefetch worker) so they overlap with GPU inference on the main thread.
+    """
     if arr.size == 0:
         print(f"[{match_id}/{half_id}] empty tactical array; skipping")
         return 0
@@ -414,87 +500,158 @@ def precompute_for_half(
     if global_step is None:
         global_step = [0]
 
-    cap = _open_video(video_path)
-    try:
-        _seek(cap, start_frame)
-        processed = 0
-        cur_frame = start_frame
-        by_frame = {f: rows for f, rows in _frame_iter(arr)}
+    by_frame = {f: rows for f, rows in _frame_iter(arr)}
+    batch_size = max(1, int(args.batch_size))
+    prefetch_queue_size = max(1, int(args.prefetch_queue_size))
 
-        half_t_read = half_t_crop = half_t_infer = half_t_store = 0.0
-        half_start = time.perf_counter()
+    pending: list[dict] = []
+    pending_crop_count = 0
 
-        while cur_frame <= end_frame:
+    processed = 0
+    half_t_read = half_t_crop = half_t_infer = half_t_store = 0.0
+    half_t_queue_wait = 0.0
+    queue_stalls = 0
+    batch_fill_fracs: list[float] = []
+    half_start = time.perf_counter()
+
+    def _flush_pending() -> None:
+        nonlocal half_t_infer, half_t_store, pending_crop_count
+        if not pending:
+            return
+
+        total_crops = pending_crop_count
+        entries_with_crops = [p for p in pending if p["n_valid"] > 0]
+        t_infer_total = t_store_total = 0.0
+
+        if entries_with_crops:
+            all_crops = np.concatenate(
+                [p["crops"] for p in entries_with_crops], axis=0
+            )
             t0 = time.perf_counter()
-            frame = _read_frame_bgr_to_rgb(cap)
-            t_read = time.perf_counter() - t0
-            if frame is None:
-                break
+            all_feats = extractor.extract_features(all_crops)
+            t_infer_total = time.perf_counter() - t0
+            half_t_infer += t_infer_total
 
-            t_crop = t_infer = t_store = 0.0
-            n_players = n_valid = 0
+            t0 = time.perf_counter()
+            offset = 0
+            for p in entries_with_crops:
+                n = p["n_valid"]
+                store.add_frame(
+                    match_id=match_id,
+                    half_id=half_id,
+                    frame=p["frame"],
+                    player_ids=p["pids"],
+                    features=all_feats[offset : offset + n],
+                    visible=[True] * n,
+                )
+                offset += n
+            t_store_total = time.perf_counter() - t0
+            half_t_store += t_store_total
 
-            rows = by_frame.get(int(cur_frame))
-            if rows is not None and rows.shape[0] > 0:
-                n_players = rows.shape[0]
-                rois = rows[:, [COL["roi_x"], COL["roi_y"], COL["roi_width"], COL["roi_height"]]]
-                pids = rows[:, COL["player_id"]].astype(np.int64)
+        fill_frac = total_crops / batch_size
+        batch_fill_fracs.append(fill_frac)
 
-                t0 = time.perf_counter()
-                crops, mask = cropper.extract(frame, rois)
-                t_crop = time.perf_counter() - t0
+        if wandb_run is not None:
+            n_frames = len(pending)
+            n_with_crops = max(1, len(entries_with_crops))
+            base_step = global_step[0] - n_frames
 
-                if mask.any():
-                    n_valid = int(mask.sum())
-                    t0 = time.perf_counter()
-                    feats = extractor.extract_features(crops[mask])
-                    t_infer = time.perf_counter() - t0
+            wandb_run.log(
+                {
+                    "batch/n_crops": total_crops,
+                    "batch/n_frames": n_frames,
+                    "batch/fill_frac": fill_frac,
+                    "batch/infer_ms": t_infer_total * 1e3,
+                    "batch/crops_per_sec": (
+                        total_crops / t_infer_total if t_infer_total > 0 else 0.0
+                    ),
+                    "match_id": match_id,
+                    "half_id": half_id,
+                },
+                step=global_step[0],
+            )
 
-                    t0 = time.perf_counter()
-                    visible_pids = pids[mask].tolist()
-                    store.add_frame(
-                        match_id=match_id,
-                        half_id=half_id,
-                        frame=int(cur_frame),
-                        player_ids=visible_pids,
-                        features=feats,
-                        visible=[True] * feats.shape[0],
-                    )
-                    t_store = time.perf_counter() - t0
-
-            half_t_read += t_read
-            half_t_crop += t_crop
-            half_t_infer += t_infer
-            half_t_store += t_store
-
-            processed += 1
-            global_step[0] += 1
-
-            if wandb_run is not None:
-                t_frame_total = t_read + t_crop + t_infer + t_store
+            for i, p in enumerate(pending):
+                n_v = p["n_valid"]
+                t_infer_approx = (
+                    t_infer_total * n_v / total_crops if total_crops > 0 else 0.0
+                )
+                t_store_approx = t_store_total / n_with_crops
                 wandb_run.log(
                     {
-                        "frame/read_ms": t_read * 1e3,
-                        "frame/crop_ms": t_crop * 1e3,
-                        "frame/infer_ms": t_infer * 1e3,
-                        "frame/store_ms": t_store * 1e3,
-                        "frame/total_ms": t_frame_total * 1e3,
-                        "frame/players_tracked": n_players,
-                        "frame/players_valid": n_valid,
+                        "frame/read_ms": p["t_read"] * 1e3,
+                        "frame/crop_ms": p["t_crop"] * 1e3,
+                        "frame/infer_ms": t_infer_approx * 1e3,
+                        "frame/store_ms": t_store_approx * 1e3,
+                        "frame/total_ms": (
+                            p["t_read"] + p["t_crop"] + t_infer_approx + t_store_approx
+                        ) * 1e3,
+                        "frame/players_tracked": p["n_players"],
+                        "frame/players_valid": n_v,
                         "frame/valid_crop_frac": (
-                            n_valid / n_players if n_players > 0 else 0.0
+                            n_v / p["n_players"] if p["n_players"] > 0 else 0.0
                         ),
-                        "frame/index": int(cur_frame),
+                        "frame/index": p["frame"],
                         "match_id": match_id,
                         "half_id": half_id,
                     },
-                    step=global_step[0],
+                    step=base_step + i + 1,
                 )
 
-            cur_frame += 1
+        pending.clear()
+        pending_crop_count = 0
+
+    prefetch_q: _queue.Queue = _queue.Queue(maxsize=prefetch_queue_size)
+    worker: Optional[threading.Thread] = None
+    cap = _open_video(video_path)
+    try:
+        _seek(cap, start_frame)
+        worker = threading.Thread(
+            target=_prefetch_decode_crop,
+            args=(cap, by_frame, cropper, start_frame, end_frame, prefetch_q),
+            daemon=True,
+        )
+        worker.start()
+
+        while True:
+            t0 = time.perf_counter()
+            item = prefetch_q.get()
+            t_wait = time.perf_counter() - t0
+            half_t_queue_wait += t_wait
+            if t_wait > 1e-3:
+                queue_stalls += 1
+
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise item
+
+            half_t_read += item["t_read"]
+            half_t_crop += item["t_crop"]
+            pending.append(item)
+            pending_crop_count += item["n_valid"]
+            processed += 1
+            global_step[0] += 1
+
+            if pending_crop_count >= batch_size:
+                _flush_pending()
+
+        _flush_pending()
+        worker.join()
 
         half_elapsed = time.perf_counter() - half_start
         if wandb_run is not None and processed > 0:
+            gpu_mem_alloc = gpu_mem_peak = 0.0
+            if "cuda" in str(args.device):
+                import torch as _torch
+                gpu_mem_alloc = _torch.cuda.memory_allocated() / 1e6
+                gpu_mem_peak = _torch.cuda.max_memory_allocated() / 1e6
+                _torch.cuda.reset_peak_memory_stats()
+
+            avg_fill = (
+                sum(batch_fill_fracs) / len(batch_fill_fracs)
+                if batch_fill_fracs else 0.0
+            )
             wandb_run.log(
                 {
                     "half/frames_processed": processed,
@@ -505,6 +662,11 @@ def precompute_for_half(
                     "half/infer_frac": half_t_infer / half_elapsed,
                     "half/store_frac": half_t_store / half_elapsed,
                     "half/infer_ms_per_frame": half_t_infer / processed * 1e3,
+                    "half/queue_stalls": queue_stalls,
+                    "half/queue_wait_frac": half_t_queue_wait / half_elapsed,
+                    "half/avg_batch_fill_frac": avg_fill,
+                    "half/gpu_memory_alloc_mb": gpu_mem_alloc,
+                    "half/gpu_memory_peak_mb": gpu_mem_peak,
                     "match_id": match_id,
                     "half_id": half_id,
                 },
@@ -513,6 +675,13 @@ def precompute_for_half(
 
         return processed
     finally:
+        if worker is not None and worker.is_alive():
+            try:
+                while True:
+                    prefetch_q.get_nowait()
+            except _queue.Empty:
+                pass
+            worker.join(timeout=5.0)
         cap.release()
 
 
@@ -603,6 +772,8 @@ def main(argv: list[str] | None = None) -> int:
             device=str(args.device),
             use_stub=bool(args.use_stub),
             batch_size=int(args.batch_size),
+            fp16=bool(args.fp16),
+            compile_model=bool(args.compile),
         )
         extractor = DinoV2Extractor(dino_cfg)
         metadata = VisualFeatureMetadata(
@@ -640,6 +811,9 @@ def main(argv: list[str] | None = None) -> int:
                 "batch_size": args.batch_size,
                 "device": args.device,
                 "use_stub": args.use_stub,
+                "fp16": args.fp16,
+                "compile": args.compile,
+                "prefetch_queue_size": args.prefetch_queue_size,
                 "splits": splits,
                 "n_matches": len(pairs),
                 "out_dir": str(out_root),

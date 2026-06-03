@@ -44,7 +44,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence

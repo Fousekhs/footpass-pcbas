@@ -167,6 +167,72 @@ class ShardExistsTests(unittest.TestCase):
             self.assertFalse(pvf._shard_exists(root, "game_01", "game_01_H2"))
 
 
+class ParseArgsNewFlagsTests(unittest.TestCase):
+    def test_fp16_flag_accepted(self) -> None:
+        args = pvf.parse_args(["--config", "config.toml", "--fp16"])
+        self.assertTrue(args.fp16)
+
+    def test_compile_flag_accepted(self) -> None:
+        args = pvf.parse_args(["--config", "config.toml", "--compile"])
+        self.assertTrue(args.compile)
+
+    def test_prefetch_queue_size_accepted(self) -> None:
+        args = pvf.parse_args(["--config", "config.toml", "--prefetch-queue-size", "4"])
+        self.assertEqual(args.prefetch_queue_size, 4)
+
+    def test_defaults(self) -> None:
+        args = pvf.parse_args(["--config", "config.toml"])
+        self.assertFalse(args.fp16)
+        self.assertFalse(args.compile)
+        self.assertEqual(args.prefetch_queue_size, 8)
+
+
+class PrefetchDecodeWorkerTests(unittest.TestCase):
+    def _make_fake_cap(self, frames: list):
+        """Minimal cv2.VideoCapture stand-in."""
+        class _FakeCap:
+            def __init__(self, frames):
+                self._frames = list(frames)
+                self._idx = 0
+            def read(self):
+                if self._idx >= len(self._frames):
+                    return False, None
+                f = self._frames[self._idx]
+                self._idx += 1
+                return True, f
+            def release(self):
+                pass
+        return _FakeCap(frames)
+
+    def test_worker_emits_sentinel_after_all_frames(self) -> None:
+        import queue as q_mod
+        import cv2
+        # Build 3 tiny RGB frames (fake BGR→RGB is a no-op for this test).
+        frames_bgr = [
+            np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(3)
+        ]
+        cap = self._make_fake_cap(frames_bgr)
+
+        # Patch _read_frame_bgr_to_rgb to just return the "frame" directly.
+        with mock.patch.object(pvf, "_read_frame_bgr_to_rgb", side_effect=lambda c: c.read()[1]):
+            from pcspot.features.cropper import CropperConfig, PaddedPlayerCropper
+            cropper = PaddedPlayerCropper(CropperConfig(crop_size=8, pad_factor=1.0))
+            out_q = q_mod.Queue()
+            by_frame: dict = {}
+            pvf._prefetch_decode_crop(cap, by_frame, cropper, 0, 2, out_q)
+
+        items = []
+        while True:
+            item = out_q.get_nowait()
+            if item is None:
+                break
+            items.append(item)
+
+        self.assertEqual(len(items), 3)
+        self.assertEqual([it["frame"] for it in items], [0, 1, 2])
+        self.assertTrue(all(it["n_valid"] == 0 for it in items))
+
+
 class MainDryRunTests(unittest.TestCase):
     def test_dry_run_records_planned_matches_without_torch(self) -> None:
         with TemporaryDirectory() as tmp:

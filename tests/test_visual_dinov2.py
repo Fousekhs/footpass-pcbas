@@ -39,6 +39,26 @@ class StubExtractorTests(unittest.TestCase):
         f2 = ex.extract_features(crops)
         self.assertTrue(np.allclose(f1, f2))
 
+    def test_fp16_flag_no_crash_on_cpu(self) -> None:
+        """fp16=True should be a no-op on CPU (autocast only activates on CUDA)."""
+        cfg = DinoV2Config(crop_size=16, feature_dim=8, use_stub=True, fp16=True)
+        ex = DinoV2Extractor(cfg)
+        crops = (np.random.rand(3, 16, 16, 3) * 255).astype(np.uint8)
+        feats = ex.extract_features(crops)
+        self.assertEqual(feats.shape, (3, 8))
+        self.assertEqual(feats.dtype, np.float32)
+
+    def test_compile_model_flag_with_stub(self) -> None:
+        """compile_model=True should be skipped gracefully for stub backbones."""
+        cfg = DinoV2Config(
+            crop_size=16, feature_dim=8, use_stub=True, compile_model=True
+        )
+        ex = DinoV2Extractor(cfg)
+        crops = (np.random.rand(2, 16, 16, 3) * 255).astype(np.uint8)
+        feats = ex.extract_features(crops)
+        self.assertEqual(feats.shape, (2, 8))
+        self.assertEqual(feats.dtype, np.float32)
+
     def test_pipeline_with_cropper(self) -> None:
         cfg_extract = DinoV2Config(crop_size=32, feature_dim=8, use_stub=True)
         ex = DinoV2Extractor(cfg_extract)

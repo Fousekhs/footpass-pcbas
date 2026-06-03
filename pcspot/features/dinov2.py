@@ -63,6 +63,8 @@ class DinoV2Config:
     device: str = "cpu"
     use_stub: bool = False
     batch_size: int = 32
+    fp16: bool = False
+    compile_model: bool = False
 
 
 class _SupportsForward(Protocol):
@@ -138,6 +140,11 @@ def _load_dinov2_backbone(config: DinoV2Config) -> _SupportsForward:
     model = model.to(config.device).eval()
     for p in model.parameters():
         p.requires_grad_(False)
+    if config.compile_model:
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+        except Exception:  # pragma: no cover — compile unavailable on some platforms
+            pass
     return model
 
 
@@ -188,7 +195,9 @@ class DinoV2Extractor:
             arr = crops.astype(np.float32)
         # (N, H, W, 3) -> (N, 3, H, W)
         x = torch.from_numpy(np.ascontiguousarray(arr.transpose(0, 3, 1, 2)))
-        x = x.to(self.config.device, non_blocking=False)
+        if "cuda" in self.config.device:
+            x = x.pin_memory()
+        x = x.to(self.config.device, non_blocking=True)
         x = (x - self._mean) / self._std
         return x
 
@@ -206,7 +215,11 @@ class DinoV2Extractor:
             return np.zeros((0, self.feature_dim), dtype=np.float32)
         out_chunks: list[np.ndarray] = []
         bs = max(1, int(self.config.batch_size))
-        with torch.inference_mode():
+        _device_type = "cuda" if "cuda" in self.config.device else "cpu"
+        _use_amp = self.config.fp16 and _device_type == "cuda"
+        with torch.inference_mode(), torch.autocast(
+            device_type=_device_type, enabled=_use_amp
+        ):
             for i in range(0, crops.shape[0], bs):
                 batch = self._preprocess(crops[i : i + bs])
                 feats = self._backbone(batch)
