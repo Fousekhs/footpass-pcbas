@@ -198,7 +198,8 @@ class MainSkipExistingTests(unittest.TestCase):
             for e in _fake_entries():
                 p = out / "raw" / e.repo_path
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_bytes(b"\0" * (e.size or 0))
+                with p.open("wb") as fh:
+                    fh.truncate(e.size or 0)
             cfg_path = _write_config(Path(tmp), out)
             # --no-extract keeps the test free of py7zr/pyzipper dependencies.
             argv = ["--config", str(cfg_path), "--splits", "VAL", "--no-extract"]
