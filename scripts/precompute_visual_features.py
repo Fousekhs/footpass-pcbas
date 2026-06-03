@@ -245,30 +245,27 @@ def load_match_list(path: Path) -> set[str]:
 
 
 def discover_matches_in_split(output_dir: Path, split: str) -> list[MatchAssets]:
-    """Locate the (tactical_dir, video_dir) for one split and list its matches.
+    """Locate the (tactical_dir, video_dirs) for one split and list its matches.
 
     The full mirror extracts each split into its own
-    ``extracted/tactical_data_<SPLIT>/`` and ``extracted/videos_*_<SPLIT>/``
-    sub-directories. This helper restricts ``list_matches`` to one split by
-    pointing it at an isolated working directory whose ``extracted/`` only
-    references the matching split's sub-directories via symlinks.
-
-    For environments where symlinks are not supported (Windows without
-    developer mode), the helper falls back to inspecting the HDF5 files
-    directly and skipping the symlink dance.
+    ``extracted/tactical_data_<SPLIT>/`` and one or more
+    ``extracted/videos_*_<SPLIT>_NN/`` sub-directories (the dataset ships
+    TRAIN videos across multiple numbered archives). This helper collects
+    all matching video directories so every match video can be found
+    regardless of which numbered folder it lives in.
     """
     extracted = output_dir / "extracted"
     if not extracted.exists():
         return []
-    tactical_dir = _find_dir_for_split(extracted, "tactical_data_", split)
-    video_dir = _find_dir_for_split(extracted, "videos_", split)
-    if tactical_dir is None or video_dir is None:
+    tactical_dir = _find_first_dir_for_split(extracted, "tactical_data_", split)
+    video_dirs = _find_all_dirs_for_split(extracted, "videos_", split)
+    if tactical_dir is None or not video_dirs:
         return []
-    return _list_matches_in(tactical_dir, video_dir)
+    return _list_matches_in(tactical_dir, video_dirs)
 
 
-def _find_dir_for_split(extracted: Path, prefix: str, split: str) -> Path | None:
-    """Find a sibling directory of `extracted/` matching ``<prefix>*<split>``."""
+def _find_first_dir_for_split(extracted: Path, prefix: str, split: str) -> Path | None:
+    """Return the first directory matching ``<prefix>*<split>*``."""
     target = f"_{split.lower()}"
     for child in sorted(extracted.iterdir()):
         if not child.is_dir():
@@ -279,8 +276,26 @@ def _find_dir_for_split(extracted: Path, prefix: str, split: str) -> Path | None
     return None
 
 
-def _list_matches_in(tactical_dir: Path, video_dir: Path) -> list[MatchAssets]:
-    """Mirror of ``pcbas_data.list_matches`` but with explicit directories."""
+def _find_all_dirs_for_split(extracted: Path, prefix: str, split: str) -> list[Path]:
+    """Return ALL directories matching ``<prefix>*<split>*`` (e.g. numbered TRAIN folders)."""
+    target = f"_{split.lower()}"
+    dirs: list[Path] = []
+    for child in sorted(extracted.iterdir()):
+        if not child.is_dir():
+            continue
+        name = child.name.lower()
+        if name.startswith(prefix.lower()) and target in name:
+            dirs.append(child)
+    return dirs
+
+
+def _list_matches_in(tactical_dir: Path, video_dirs: list[Path]) -> list[MatchAssets]:
+    """Mirror of ``pcbas_data.list_matches`` but with explicit directories.
+
+    Searches across all provided video_dirs to locate each match's MP4,
+    which handles splits whose videos are spread across multiple numbered
+    archive folders (e.g. videos_fullHD_TRAIN_01, _02, _03 ...).
+    """
     import h5py
 
     h5_files = sorted(tactical_dir.glob("*.h5"))
@@ -302,12 +317,21 @@ def _list_matches_in(tactical_dir: Path, video_dir: Path) -> list[MatchAssets]:
         else:
             halves_by_match.setdefault(k, []).append(k)
 
+    def _find_video(match_id: str) -> Path:
+        for vdir in video_dirs:
+            candidate = vdir / f"{match_id}.mp4"
+            if candidate.exists():
+                return candidate
+        # Fall back to the first directory so the missing-video message
+        # still names a sensible path instead of a generic placeholder.
+        return video_dirs[0] / f"{match_id}.mp4"
+
     matches: list[MatchAssets] = []
     for match_id, halves in halves_by_match.items():
         matches.append(
             MatchAssets(
                 match_id=match_id,
-                video_path=video_dir / f"{match_id}.mp4",
+                video_path=_find_video(match_id),
                 halves=sorted(halves),
                 tactical_h5=h5_path,
             )
