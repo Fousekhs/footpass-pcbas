@@ -140,9 +140,11 @@ def _load_dinov2_backbone(config: DinoV2Config) -> _SupportsForward:
     model = model.to(config.device).eval()
     for p in model.parameters():
         p.requires_grad_(False)
+    if "cuda" in config.device:
+        torch.backends.cudnn.benchmark = True
     if config.compile_model:
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            model = torch.compile(model, mode="max-autotune", dynamic=True)
         except Exception:  # pragma: no cover — compile unavailable on some platforms
             pass
     return model
