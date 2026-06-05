@@ -1,0 +1,77 @@
+# W&B Bayesian sweep over model and training hyperparameters.
+#
+# Usage:
+#   # Option A – let sweep.py create the sweep and launch the agent in one step:
+#   python scripts/sweep.py \
+#       --sweep-config configs/sweeps/hyperparams.yaml \
+#       --splits data/splits.json \
+#       --output-dir checkpoints/sweeps \
+#       --validation-split val \
+#       --keep-best-metric val/map_joint \
+#       --device cuda:0 --epochs 10 --count 20
+#
+#   # Option B – create the sweep manually first, then pass the ID:
+#   wandb sweep configs/sweeps/hyperparams.yaml
+#   python scripts/sweep.py --sweep-id <entity/project/id> ...
+#
+# The metric `val/map_joint` is the joint (player-identity-aware) mAP
+# averaged over the tolerances in --metric-tolerances.  Set
+# --validation-split and --keep-best-metric accordingly.
+
+program: scripts/sweep.py
+method: bayes
+
+metric:
+  name: val/map_joint
+  goal: maximize
+
+parameters:
+  # --- Optimizer ---
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.000010
+    max: 0.001
+
+  warmup_steps:
+    values: [25, 50, 100]
+
+  grad_clip:
+    values: [0.5, 1.0, 2.0]
+
+  # --- Model architecture ---
+  hidden_dim:
+    values: [64, 128, 256]
+
+  num_mstcn_stages:
+    values: [2, 3, 4]
+
+  num_mstcn_layers:
+    values: [6, 8, 10, 12]
+
+  # --- Architecture toggles ---
+  # Each flag can be disabled to measure its contribution to val/map_joint.
+  # Note: adding all four binary params multiplies the search space by up to
+  # 16x.  If your sweep budget is < 30 trials, consider a separate ablation
+  # run for these toggles rather than mixing them with the continuous params.
+  use_zone_nodes:
+    values: [true, false]
+
+  use_jersey:
+    values: [true, false]
+
+  use_goal_distances:
+    values: [true, false]
+
+  use_radius_edges:
+    values: [true, false]
+
+  # --- Sampler (only relevant when --sampler mixed is set via fixed args) ---
+  positive_ratio:
+    distribution: uniform
+    min: 0.3
+    max: 0.8

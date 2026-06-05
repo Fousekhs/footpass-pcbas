@@ -1113,16 +1113,13 @@ def _parse_tolerances(spec: str) -> list[int]:
     return out
 
 
-def main() -> int:
-    # Pre-parse --train-config so its values become the parser's
-    # defaults; any CLI flag still wins on the real parse pass below.
-    train_config_path = _preparse_train_config()
-    file_defaults: dict[str, Any] = {}
-    if train_config_path is not None:
-        file_defaults = _load_train_config(train_config_path.resolve())
+def run(args: argparse.Namespace, *, wandb_run: Any = None) -> int:
+    """Execute a training run from a pre-built Namespace.
 
-    args = _build_argparser(defaults=file_defaults).parse_args()
-
+    Called by :func:`main` for normal CLI use, or directly by
+    ``scripts/sweep.py`` with a W&B run already initialized by the
+    sweep agent (``wandb_run`` passed in, ``_init_wandb`` skipped).
+    """
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -1371,8 +1368,7 @@ def main() -> int:
     run_info_path = args.output_dir / "run.json"
     run_info_path.write_text(json.dumps(run_info, indent=2), encoding="utf-8")
 
-    wandb_run = None
-    if args.wandb:
+    if wandb_run is None and args.wandb:
         wandb_run = _init_wandb(args, run_info)
 
     validation_fn: Optional[Callable[[Trainer], dict[str, float]]] = None
@@ -1435,6 +1431,17 @@ def main() -> int:
 
     print(f"Done. Checkpoints at {args.output_dir}")
     return 0
+
+
+def main() -> int:
+    # Pre-parse --train-config so its values become the parser's
+    # defaults; any CLI flag still wins on the real parse pass below.
+    train_config_path = _preparse_train_config()
+    file_defaults: dict[str, Any] = {}
+    if train_config_path is not None:
+        file_defaults = _load_train_config(train_config_path.resolve())
+    args = _build_argparser(defaults=file_defaults).parse_args()
+    return run(args)
 
 
 if __name__ == "__main__":

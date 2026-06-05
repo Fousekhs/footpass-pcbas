@@ -5,20 +5,25 @@
 # FIRST, then `pip install -r requirements.txt` will keep the rest of
 # the pins without touching torch / torchvision.
 #
-# Recommended setup (CUDA 12.1, adjust the index URL if the rented
-# instance ships a different CUDA toolkit):
+# Recommended setup — match the --index-url suffix to your driver's CUDA ceiling:
+#
+#   Driver ≤ 570.x  →  CUDA 12.8 max  →  use cu128  (e.g. RTX 5090 on Vast.ai)
+#   Driver ≤ 545.x  →  CUDA 12.4 max  →  use cu124
+#   Driver ≤ 530.x  →  CUDA 12.1 max  →  use cu121
 #
 #   python -m venv .venv
 #   source .venv/bin/activate
 #   pip install --upgrade pip
-#   pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/cu128
 #   pip install -r requirements.txt
 #
 # After this two-step install, `python -c "import torch; print(torch.cuda.is_available())"`
 # should print True.
 #
-# Versions match those in requirements.txt minus the "+cpu" local tag,
+# Note: torch==2.12.0 is only available as +cu130 (requires CUDA 13.0+ driver).
+# torch==2.11.0 is the latest release that supports CUDA 12.8 (cu128).
+# Versions here match those in requirements.txt minus the "+cpu" local tag,
 # so the CUDA wheels resolve cleanly from the PyTorch index.
 
-torch==2.12.0
-torchvision==0.27.0
+torch==2.11.0
+torchvision==0.26.0
