@@ -54,21 +54,9 @@ parameters:
     values: [6, 8, 10, 12]
 
   # --- Architecture toggles ---
-  # Each flag can be disabled to measure its contribution to val/map_joint.
-  # Note: adding all four binary params multiplies the search space by up to
-  # 16x.  If your sweep budget is < 30 trials, consider a separate ablation
-  # run for these toggles rather than mixing them with the continuous params.
-  use_zone_nodes:
-    values: [true, false]
-
-  use_jersey:
-    values: [true, false]
-
-  use_goal_distances:
-    values: [true, false]
-
-  use_radius_edges:
-    values: [true, false]
+  # use_zone_nodes / use_jersey / use_goal_distances / use_radius_edges are
+  # deliberately NOT swept: we assume all four on (their argparse defaults) is
+  # best. Add them back here as {values: [true, false]} to run an ablation.
 
   # --- Sampler (only relevant when --sampler mixed is set via fixed args) ---
   positive_ratio:
