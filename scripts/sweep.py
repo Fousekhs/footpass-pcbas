@@ -101,6 +101,28 @@ def _build_sweep_argparser() -> argparse.ArgumentParser:
                    help="Number of training epochs per trial.")
     p.add_argument("--device", default="cpu")
 
+    # Training throughput knobs (fixed across all trials). These are forwarded
+    # to train.py so the sweep does not silently fall back to its defaults
+    # (--sampler sequential, --num-workers 0), which eagerly materialises every
+    # window on one core before the first step.
+    p.add_argument(
+        "--sampler",
+        default=None,
+        choices=["sequential", "mixed", "uniform"],
+        help=(
+            "Window sampler. Use 'mixed' to honour the swept positive_ratio; "
+            "'sequential' (train.py default) ignores positive_ratio and "
+            "materialises all windows up front."
+        ),
+    )
+    p.add_argument("--num-workers", type=int, default=None,
+                   help="DataLoader worker processes. >0 streams batches instead "
+                        "of materialising the full window list on one core.")
+    p.add_argument("--samples-per-epoch", type=int, default=None,
+                   help="Windows drawn per epoch for mixed/uniform samplers.")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Training batch size (passed through to train.py).")
+
     # Visual cache (optional, fixed across all trials)
     p.add_argument("--visual-cache", type=Path, default=None)
     p.add_argument("--visual-backbone", default="dinov2_vits14")
@@ -160,6 +182,14 @@ def _make_trial_fn(fixed: argparse.Namespace) -> Any:
                 cli += ["--validation-stride", str(fixed.validation_stride)]
             if fixed.keep_best_metric is not None:
                 cli += ["--keep-best-metric", fixed.keep_best_metric]
+            if fixed.sampler is not None:
+                cli += ["--sampler", fixed.sampler]
+            if fixed.num_workers is not None:
+                cli += ["--num-workers", str(fixed.num_workers)]
+            if fixed.samples_per_epoch is not None:
+                cli += ["--samples-per-epoch", str(fixed.samples_per_epoch)]
+            if fixed.batch_size is not None:
+                cli += ["--batch-size", str(fixed.batch_size)]
 
             args = _build_argparser(defaults=swept).parse_args(cli)
             # The wandb run is already open — tell run() not to call wandb.init() again.

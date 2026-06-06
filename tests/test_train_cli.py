@@ -43,6 +43,7 @@ class _FakeWandbRun:
     def __init__(self) -> None:
         self.id = "fake-run-id"
         self.calls: list[tuple[dict, int | None]] = []
+        self.summary: dict = {}
         self.finished = False
 
     def log(self, payload, step=None):
@@ -225,6 +226,48 @@ class MakeLogFnTests(unittest.TestCase):
         payload, _ = run.calls[0]
         self.assertIn("val/map", payload)
         self.assertNotIn("bad", payload)
+
+    def test_wandb_best_metric_tracks_max_and_epoch(self) -> None:
+        run = _FakeWandbRun()
+        log = train_cli.make_log_fn(
+            wandb_run=run, print_fn=lambda _s: None, best_metric="val/map_joint"
+        )
+
+        def _epoch(ep: int, mj: float) -> None:
+            log(EpochLog(
+                epoch=ep, num_steps=1,
+                avg_total_loss=0.1, avg_bce_loss=0.1,
+                avg_tmse_loss=0.0, avg_objectness_loss=0.0,
+                last_learning_rate=1e-3,
+                validation={"val/map_joint": mj},
+            ))
+
+        _epoch(0, 0.30)
+        _epoch(1, 0.55)  # best
+        _epoch(2, 0.40)  # worse: best must not regress
+        self.assertAlmostEqual(run.summary["best/val/map_joint"], 0.55)
+        self.assertEqual(run.summary["best/epoch"], 1)
+
+    def test_wandb_best_metric_minimises_loss(self) -> None:
+        run = _FakeWandbRun()
+        log = train_cli.make_log_fn(
+            wandb_run=run, print_fn=lambda _s: None, best_metric="val/loss"
+        )
+
+        def _epoch(ep: int, loss: float) -> None:
+            log(EpochLog(
+                epoch=ep, num_steps=1,
+                avg_total_loss=0.1, avg_bce_loss=0.1,
+                avg_tmse_loss=0.0, avg_objectness_loss=0.0,
+                last_learning_rate=1e-3,
+                validation={"val/loss": loss},
+            ))
+
+        _epoch(0, 0.90)
+        _epoch(1, 0.40)  # best (lower is better)
+        _epoch(2, 0.70)
+        self.assertAlmostEqual(run.summary["best/val/loss"], 0.40)
+        self.assertEqual(run.summary["best/epoch"], 1)
 
 
 class MakeValidationFnTests(unittest.TestCase):

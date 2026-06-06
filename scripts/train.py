@@ -44,11 +44,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
@@ -71,6 +71,10 @@ from pcspot.data.sampling import (
     build_dataset_batch_provider,
     reseeded_mixed_sampler_factory,
 )
+# Canonical JSON-safe rendering of a CalfConfig (frozensets -> sorted
+# lists). Shared with the target cache so run.json and the cache key
+# agree on the config's serialised form.
+from pcspot.data.cache import _serializable_config as _calf_serializable
 from pcspot.data.schema import NUM_PCBAS_CLASSES, EventLabel
 from pcspot.data.splits import SplitManifest
 from pcspot.data.targets import CalfConfig
@@ -180,11 +184,16 @@ def _format_epoch_log(record: EpochLog) -> str:
     )
 
 
+def _best_is_better(new: float, old: float, mode: str) -> bool:
+    return new > old if mode == "max" else new < old
+
+
 def make_log_fn(
     *,
     wandb_run: Any = None,
     print_fn: Callable[[str], None] = print,
     extra_sinks: Sequence[Callable[[Any], None]] = (),
+    best_metric: Optional[str] = None,
 ) -> Callable[[TrainStepLog | EpochLog], None]:
     """Build a ``log_fn`` callback for :func:`Trainer.fit`.
 
@@ -193,8 +202,20 @@ def make_log_fn(
     Weights & Biases on the same step axis as the trainer. Each entry in
     ``extra_sinks`` is invoked with the raw record (e.g. a
     metrics.jsonl appender).
+
+    When ``best_metric`` is given (e.g. ``"val/map_joint"``) the running best
+    of that metric is tracked and mirrored into ``wandb_run.summary`` as
+    ``best/<metric>`` plus the epoch it occurred on, so a sweep's summary table
+    and parallel-coordinates plot reflect the best epoch rather than the last.
+    The direction is inferred from the name: metrics containing ``loss`` /
+    ``error`` are minimised, everything else maximised.
     """
-    state: dict[str, int] = {"last_step": 0}
+    best_mode = (
+        "min"
+        if best_metric and any(t in best_metric.lower() for t in ("loss", "error"))
+        else "max"
+    )
+    state: dict[str, Any] = {"last_step": 0, "best": None, "epoch_t0": None}
 
     def _log(record: TrainStepLog | EpochLog) -> None:
         for sink in extra_sinks:
@@ -204,6 +225,8 @@ def make_log_fn(
                 print(f"warning: log sink failed: {exc}", file=sys.stderr)
         if isinstance(record, TrainStepLog):
             state["last_step"] = int(record.step)
+            if state["epoch_t0"] is None:
+                state["epoch_t0"] = time.perf_counter()
             print_fn(_format_step_log(record))
             if wandb_run is not None:
                 wandb_run.log(
@@ -229,11 +252,32 @@ def make_log_fn(
                     "train/last_learning_rate": float(record.last_learning_rate),
                     "train/num_steps_this_epoch": int(record.num_steps),
                 }
+                # Wall-clock timing + throughput for this epoch.
+                if state["epoch_t0"] is not None:
+                    epoch_secs = time.perf_counter() - state["epoch_t0"]
+                    payload["time/epoch_seconds"] = float(epoch_secs)
+                    if record.num_steps and epoch_secs > 0:
+                        payload["time/steps_per_second"] = float(
+                            record.num_steps / epoch_secs
+                        )
+                    state["epoch_t0"] = time.perf_counter()
                 for k, v in record.validation.items():
                     try:
                         payload[str(k)] = float(v)
                     except (TypeError, ValueError):
                         continue
+                # Track the running best of the chosen metric in run summary.
+                if best_metric is not None and best_metric in payload:
+                    cur = payload[best_metric]
+                    if state["best"] is None or _best_is_better(
+                        cur, state["best"], best_mode
+                    ):
+                        state["best"] = cur
+                        try:
+                            wandb_run.summary[f"best/{best_metric}"] = cur
+                            wandb_run.summary["best/epoch"] = int(record.epoch)
+                        except Exception:  # pragma: no cover - defensive
+                            pass
                 wandb_run.log(payload, step=state["last_step"])
 
     return _log
@@ -463,7 +507,10 @@ def _build_run_info(
     """
     payload: dict[str, Any] = {
         "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-        "calf_config": asdict(calf_config),
+        # ``asdict`` leaves ``attacking_classes`` / ``duel_classes`` as
+        # frozensets, which ``json.dumps`` cannot serialise; ``_calf_serializable``
+        # renders them as sorted lists.
+        "calf_config": _calf_serializable(calf_config),
         "num_train_windows": int(ds_train_len),
         "samples_per_epoch": int(n_per_epoch),
         "steps_per_epoch": int(steps_per_epoch),
@@ -627,7 +674,7 @@ def _log_wandb_artifacts(
         print(f"warning: wandb artifact upload failed: {exc}", file=sys.stderr)
 
 
-_KNOWN_SECTIONS = {"train", "validation", "wandb"}
+_KNOWN_SECTIONS = {"train", "validation", "wandb", "calf"}
 
 _KNOWN_TRAIN_KEYS = {
     "epochs",
@@ -676,6 +723,32 @@ _KNOWN_VALIDATION_KEYS = {
     "metric_tolerances",
 }
 
+# CALF loss tuning lives in its own ``[calf]`` table rather than as CLI
+# flags: the per-class overrides are dicts keyed by class id, which do
+# not map cleanly onto scalar argparse flags. These keys mirror the
+# fields of :class:`pcspot.data.targets.CalfConfig` 1:1.
+_CALF_INT_KEYS = {"k1_default", "k2_default"}
+_CALF_FLOAT_KEYS = {
+    "positive_weight",
+    "ambiguity_weight",
+    "ambiguity_radius",
+    "gaussian_sigma",
+    "teammate_floor",
+    "opponent_floor",
+    "ambiguity_time_scale",
+}
+_KNOWN_CALF_KEYS = (
+    _CALF_INT_KEYS
+    | _CALF_FLOAT_KEYS
+    | {
+        "distance_falloff",
+        "per_class_window",
+        "per_class_positive_weight",
+        "attacking_classes",
+        "duel_classes",
+    }
+)
+
 # Wandb section keys are remapped to argparse dest names because the
 # CLI flags carry the ``wandb_`` prefix while the TOML section already
 # names the integration.
@@ -691,6 +764,148 @@ _WANDB_KEY_MAP = {
 
 def _abort(message: str) -> None:
     raise SystemExit(message)
+
+
+def _calf_class_id(path: Path, ctx: str, raw: Any) -> int:
+    """Validate and return a 1-based PCBAS class id from a ``[calf]`` table."""
+    try:
+        cid = int(raw)
+    except (TypeError, ValueError):
+        _abort(
+            f"--train-config {path}: [calf].{ctx} class id {raw!r} "
+            f"must be an integer (1..{NUM_PCBAS_CLASSES})."
+        )
+    if not 1 <= cid <= NUM_PCBAS_CLASSES:
+        _abort(
+            f"--train-config {path}: [calf].{ctx} class id {cid} is out of "
+            f"range; PCBAS classes are 1..{NUM_PCBAS_CLASSES}."
+        )
+    return cid
+
+
+def _parse_calf_section(path: Path, section: dict[str, Any]) -> dict[str, Any]:
+    """Validate a ``[calf]`` table and return a JSON-safe overrides dict.
+
+    Values are normalised to plain ``int`` / ``float`` / ``str`` / ``list``
+    so the dict can ride on the argparse ``Namespace`` and be dumped into
+    ``run.json`` unchanged. The list -> ``frozenset`` / ``tuple`` promotion
+    that :class:`CalfConfig` expects happens later in
+    :func:`_build_calf_config`.
+    """
+    out: dict[str, Any] = {}
+    for k, v in section.items():
+        if k not in _KNOWN_CALF_KEYS:
+            _abort(
+                f"--train-config {path}: unknown key [calf].{k}; "
+                f"expected one of {sorted(_KNOWN_CALF_KEYS)}."
+            )
+        if k in _CALF_INT_KEYS:
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                _abort(f"--train-config {path}: [calf].{k} must be an integer.")
+            if out[k] < 0:
+                _abort(f"--train-config {path}: [calf].{k} must be >= 0.")
+        elif k in _CALF_FLOAT_KEYS:
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                _abort(f"--train-config {path}: [calf].{k} must be a number.")
+        elif k == "distance_falloff":
+            s = str(v)
+            if s not in ("hard", "gaussian"):
+                _abort(
+                    f"--train-config {path}: [calf].distance_falloff must be "
+                    f"'hard' or 'gaussian', got {v!r}."
+                )
+            out[k] = s
+        elif k in ("attacking_classes", "duel_classes"):
+            if not isinstance(v, (list, tuple)):
+                _abort(
+                    f"--train-config {path}: [calf].{k} must be a list of "
+                    f"class ids, e.g. [1, 2, 4]."
+                )
+            out[k] = [_calf_class_id(path, k, x) for x in v]
+        elif k == "per_class_window":
+            if not isinstance(v, dict):
+                _abort(
+                    f"--train-config {path}: [calf.per_class_window] must be a "
+                    f"table of class_id = [K1, K2]."
+                )
+            window: dict[int, list[int]] = {}
+            for raw_k, raw_v in v.items():
+                cid = _calf_class_id(path, "per_class_window", raw_k)
+                if not (isinstance(raw_v, (list, tuple)) and len(raw_v) == 2):
+                    _abort(
+                        f"--train-config {path}: [calf.per_class_window].{raw_k} "
+                        f"must be a 2-item list [K1, K2]."
+                    )
+                try:
+                    k1, k2 = int(raw_v[0]), int(raw_v[1])
+                except (TypeError, ValueError):
+                    _abort(
+                        f"--train-config {path}: [calf.per_class_window].{raw_k} "
+                        f"entries must be integers."
+                    )
+                if k1 < 0 or k2 <= 0:
+                    _abort(
+                        f"--train-config {path}: [calf.per_class_window].{raw_k} "
+                        f"requires K1 >= 0 and K2 > 0."
+                    )
+                window[cid] = [k1, k2]
+            out[k] = window
+        elif k == "per_class_positive_weight":
+            if not isinstance(v, dict):
+                _abort(
+                    f"--train-config {path}: [calf.per_class_positive_weight] "
+                    f"must be a table of class_id = weight."
+                )
+            weights: dict[int, float] = {}
+            for raw_k, raw_v in v.items():
+                cid = _calf_class_id(path, "per_class_positive_weight", raw_k)
+                try:
+                    w = float(raw_v)
+                except (TypeError, ValueError):
+                    _abort(
+                        f"--train-config {path}: "
+                        f"[calf.per_class_positive_weight].{raw_k} must be a number."
+                    )
+                if w < 0:
+                    _abort(
+                        f"--train-config {path}: "
+                        f"[calf.per_class_positive_weight].{raw_k} must be >= 0."
+                    )
+                weights[cid] = w
+            out[k] = weights
+    return out
+
+
+def _build_calf_config(overrides: Optional[dict[str, Any]]) -> CalfConfig:
+    """Construct a :class:`CalfConfig` from a parsed ``[calf]`` overrides dict.
+
+    ``overrides`` is the JSON-safe dict produced by
+    :func:`_parse_calf_section` (or ``None`` for built-in defaults). The
+    per-class lists are promoted back to the ``tuple`` / ``frozenset``
+    shapes that :class:`CalfConfig` stores.
+    """
+    if not overrides:
+        return CalfConfig()
+    kwargs = dict(overrides)
+    if "per_class_window" in kwargs:
+        kwargs["per_class_window"] = {
+            int(cid): (int(win[0]), int(win[1]))
+            for cid, win in kwargs["per_class_window"].items()
+        }
+    if "per_class_positive_weight" in kwargs:
+        kwargs["per_class_positive_weight"] = {
+            int(cid): float(w)
+            for cid, w in kwargs["per_class_positive_weight"].items()
+        }
+    if "attacking_classes" in kwargs:
+        kwargs["attacking_classes"] = frozenset(int(x) for x in kwargs["attacking_classes"])
+    if "duel_classes" in kwargs:
+        kwargs["duel_classes"] = frozenset(int(x) for x in kwargs["duel_classes"])
+    return CalfConfig(**kwargs)
 
 
 def _load_train_config(path: Path) -> dict[str, Any]:
@@ -773,6 +988,14 @@ def _load_train_config(path: Path) -> dict[str, Any]:
                 )
             else:
                 out[dest] = v
+
+    calf_section = data.get("calf")
+    if calf_section is not None:
+        if not isinstance(calf_section, dict):
+            _abort(f"--train-config {path}: [calf] must be a table.")
+        # Stored under a reserved key (not an argparse dest) because CALF
+        # tuning is applied via _build_calf_config rather than argparse.
+        out["_calf"] = _parse_calf_section(path, calf_section)
 
     return out
 
@@ -1179,6 +1402,10 @@ def run(args: argparse.Namespace, *, wandb_run: Any = None) -> int:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # Resolved from the Namespace so run() is self-contained whether it
+    # is driven by main() or called directly (e.g. scripts/sweep.py).
+    train_config_path = getattr(args, "train_config", None)
+
     config_path = args.config.resolve()
     if not config_path.exists():
         print(f"Config file not found: {config_path}", file=sys.stderr)
@@ -1237,7 +1464,7 @@ def run(args: argparse.Namespace, *, wandb_run: Any = None) -> int:
                 )
                 return 2
 
-    calf_config = CalfConfig()
+    calf_config = _build_calf_config(getattr(args, "calf_overrides", None))
     target_cache = None
     if args.target_cache is not None:
         from pcspot.data.cache import TargetCache
@@ -1468,6 +1695,33 @@ def run(args: argparse.Namespace, *, wandb_run: Any = None) -> int:
     if wandb_run is None and args.wandb:
         wandb_run = _init_wandb(args, run_info)
 
+    if wandb_run is not None:
+        # One-time descriptive summary so each (sweep) run is self-describing in
+        # the W&B UI without digging into run.json. Written to summary (not
+        # config) to avoid clobbering swept hyperparameters.
+        try:
+            num_params = int(sum(p.numel() for p in model.parameters()))
+            total_gt = sum(len(v) for v in val_gt_per_half.values())
+            wandb_run.summary.update(
+                {
+                    "data/train_halves": len(train_halves),
+                    "data/train_windows": int(len(ds_train)),
+                    "data/val_halves": len(val_halves),
+                    "data/val_windows": int(len(val_dataset)) if val_dataset is not None else 0,
+                    "data/val_gt_events": int(total_gt),
+                    "run/sampler": sampler_mode,
+                    "run/num_workers": int(num_workers),
+                    "run/use_dataloader": bool(use_dataloader),
+                    "run/samples_per_epoch": int(n_per_epoch),
+                    "run/steps_per_epoch": int(steps_per_epoch),
+                    "run/total_steps": int(total_steps),
+                    "model/num_params": num_params,
+                    "model/num_classes": int(model.num_classes),
+                }
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"warning: wandb summary.update failed: {exc}", file=sys.stderr)
+
     validation_fn: Optional[Callable[[Trainer], dict[str, float]]] = None
     if val_dataset is not None:
         validation_fn = make_validation_fn(
@@ -1482,7 +1736,11 @@ def run(args: argparse.Namespace, *, wandb_run: Any = None) -> int:
         )
 
     metrics_sink = _make_metrics_logger(args.output_dir)
-    log_fn = make_log_fn(wandb_run=wandb_run, extra_sinks=(metrics_sink,))
+    log_fn = make_log_fn(
+        wandb_run=wandb_run,
+        extra_sinks=(metrics_sink,),
+        best_metric=args.keep_best_metric,
+    )
 
     print(
         f"Training: epochs={args.epochs} batch_size={args.batch_size} "
@@ -1538,6 +1796,10 @@ def main() -> int:
     if train_config_path is not None:
         file_defaults = _load_train_config(train_config_path.resolve())
     args = _build_argparser(defaults=file_defaults).parse_args()
+    # CALF tuning has no CLI flags (the per-class overrides are dicts);
+    # carry the parsed [calf] table onto the Namespace so run() can apply
+    # it. ``None`` -> CalfConfig defaults.
+    args.calf_overrides = file_defaults.get("_calf")
     return run(args)
 
 
