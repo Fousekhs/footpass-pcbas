@@ -120,30 +120,64 @@ class MatchAssets:
         return len(self.halves)
 
 
-def find_split_dirs(output_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
-    """Return (tactical_dir, video_dir) found under extracted/."""
+def _split_key(name: str) -> str:
+    """Trailing split token of a folder name, lower-cased.
+
+    e.g. ``tactical_data_TRAIN`` -> ``train`` and ``videos_720p_TRAIN`` ->
+    ``train`` so the two can be paired up.
+    """
+    return name.rsplit("_", 1)[-1].lower()
+
+
+def find_all_split_dirs(output_dir: Path) -> list[tuple[Path, Optional[Path]]]:
+    """Return ``(tactical_dir, video_dir)`` pairs for every usable split.
+
+    The ``extracted/`` layout has one folder per split (``tactical_data_TRAIN``,
+    ``tactical_data_VALID``, ``tactical_data_CHALLENGE``, …) plus matching
+    ``videos_<res>_<SPLIT>`` folders. Tactical and video folders are paired by
+    their trailing split token so ``tactical_data_TRAIN`` lines up with
+    ``videos_<res>_TRAIN``. The video dir is optional (it is unused when a
+    visual-feature cache is supplied).
+
+    **Challenge splits are excluded**: their tactical arrays drop the ``class``
+    label column and so cannot be used for supervised training or validation.
+    """
     extracted = output_dir / "extracted"
     if not extracted.exists():
-        return (None, None)
-    tactical_dir = None
-    video_dir = None
+        return []
+    tactical_by_split: dict[str, Path] = {}
+    video_by_split: dict[str, Path] = {}
     for child in sorted(extracted.iterdir()):
         if not child.is_dir():
             continue
         name = child.name.lower()
-        if name.startswith("tactical_data_") and tactical_dir is None:
-            tactical_dir = child
-        elif name.startswith("videos_") and video_dir is None:
-            video_dir = child
-    return tactical_dir, video_dir
+        if "challenge" in name:
+            continue
+        key = _split_key(child.name)
+        if name.startswith("tactical_data_"):
+            tactical_by_split.setdefault(key, child)
+        elif name.startswith("videos_"):
+            video_by_split.setdefault(key, child)
+    return [
+        (tactical_by_split[key], video_by_split.get(key))
+        for key in sorted(tactical_by_split)
+    ]
 
 
-def list_matches(output_dir: Path) -> list[MatchAssets]:
-    """Discover available matches from extracted tactical+video folders."""
-    tactical_dir, video_dir = find_split_dirs(output_dir)
-    if tactical_dir is None or video_dir is None:
-        return []
+def find_split_dirs(output_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
+    """Return the first usable ``(tactical_dir, video_dir)`` pair.
 
+    Backwards-compatible shim; prefer :func:`find_all_split_dirs`, which
+    returns every non-challenge split rather than just the first.
+    """
+    pairs = find_all_split_dirs(output_dir)
+    if not pairs:
+        return (None, None)
+    return pairs[0]
+
+
+def _matches_in_dir(tactical_dir: Path, video_dir: Optional[Path]) -> list[MatchAssets]:
+    """Discover matches inside a single split's tactical folder."""
     h5_files = sorted(tactical_dir.glob("*.h5"))
     if not h5_files:
         return []
@@ -164,7 +198,7 @@ def list_matches(output_dir: Path) -> list[MatchAssets]:
 
     matches: list[MatchAssets] = []
     for match_id, halves in halves_by_match.items():
-        video_path = video_dir / f"{match_id}.mp4"
+        video_path = (video_dir / f"{match_id}.mp4") if video_dir is not None else Path(f"{match_id}.mp4")
         matches.append(
             MatchAssets(
                 match_id=match_id,
@@ -173,6 +207,24 @@ def list_matches(output_dir: Path) -> list[MatchAssets]:
                 tactical_h5=h5_path,
             )
         )
+    return matches
+
+
+def list_matches(output_dir: Path) -> list[MatchAssets]:
+    """Discover matches across every usable (non-challenge) split.
+
+    Merges the TRAIN and VALID splits so the caller's split manifest can
+    partition them; the challenge split is skipped (see
+    :func:`find_all_split_dirs`).
+    """
+    matches: list[MatchAssets] = []
+    seen: set[str] = set()
+    for tactical_dir, video_dir in find_all_split_dirs(output_dir):
+        for match in _matches_in_dir(tactical_dir, video_dir):
+            if match.match_id in seen:
+                continue
+            seen.add(match.match_id)
+            matches.append(match)
     return matches
 
 
