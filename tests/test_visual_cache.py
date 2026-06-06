@@ -86,6 +86,45 @@ class ShardIndexTests(unittest.TestCase):
         # Missing rows are zero.
         self.assertEqual(int(out[1, 1].sum()), 0)
 
+    def test_lookup_window_matches_scalar_lookup(self) -> None:
+        # The vectorised lookup_window must agree cell-for-cell with the
+        # scalar lookup() across present/missing frames, present/missing
+        # players, and invisible rows.
+        rng = np.random.default_rng(7)
+        n_frames = 12
+        players = [101, 202, 303, 404]
+        rows_f: list[int] = []
+        rows_p: list[int] = []
+        rows_vis: list[bool] = []
+        for f in range(n_frames):
+            for pid in players:
+                # Randomly drop some (frame, player) rows entirely.
+                if rng.random() < 0.25:
+                    continue
+                rows_f.append(f)
+                rows_p.append(pid)
+                rows_vis.append(bool(rng.random() > 0.3))
+        frames = np.array(rows_f, dtype=np.int64)
+        pids = np.array(rows_p, dtype=np.int64)
+        feats = rng.standard_normal((len(rows_f), 5)).astype(np.float32)
+        visible = np.array(rows_vis, dtype=bool)
+        shard = _ShardIndex.from_arrays(frames, pids, feats, visible)
+
+        # Query a window that includes a frame with no rows at all (99).
+        q_frames = list(range(n_frames)) + [99]
+        q_players = [404, 101, 999, 202]  # includes an absent player (999)
+        out, valid = shard.lookup_window(q_frames, q_players)
+
+        for ti, f in enumerate(q_frames):
+            for pi, pid in enumerate(q_players):
+                vec = shard.lookup(int(f), int(pid))
+                if vec is None:
+                    self.assertFalse(bool(valid[ti, pi]))
+                    self.assertEqual(int(out[ti, pi].sum() != 0), 0)
+                else:
+                    self.assertTrue(bool(valid[ti, pi]))
+                    self.assertTrue(np.allclose(out[ti, pi], vec))
+
 
 class StoreCacheRoundtripTests(unittest.TestCase):
     def test_write_and_read_back(self) -> None:

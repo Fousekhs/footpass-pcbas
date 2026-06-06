@@ -150,20 +150,44 @@ class _ShardIndex:
         respectively, where ``valid[t, p]`` is True when the cache had
         a visible row for that ``(frame, player_id)``.
         """
-        frames = list(frames)
-        player_ids = list(player_ids)
-        T = len(frames)
-        P = len(player_ids)
+        req_frames = np.asarray(list(frames), dtype=np.int64)
+        req_players = np.asarray(list(player_ids), dtype=np.int64)
+        T = int(req_frames.shape[0])
+        P = int(req_players.shape[0])
         F = int(self.features.shape[1]) if self.features.size else 0
         out = np.zeros((T, P, F), dtype=np.float32)
         valid = np.zeros((T, P), dtype=bool)
-        for ti, f in enumerate(frames):
-            for pi, pid in enumerate(player_ids):
-                vec = self.lookup(int(f), int(pid))
-                if vec is None:
-                    continue
-                out[ti, pi] = vec
-                valid[ti, pi] = True
+        if F == 0 or P == 0 or T == 0:
+            return out, valid
+        # Vectorise over players per frame instead of a T x P Python loop.
+        # For each frame we match the P requested player ids against the rows
+        # present for that frame with a single sorted searchsorted, which keeps
+        # the cost at O(T * P log n) in NumPy rather than O(T * P) interpreted
+        # dict lookups. (frame, player) pairs are unique per shard, so taking
+        # the first sorted match is equivalent to the scalar ``lookup``.
+        for ti in range(T):
+            span = self.frame_starts.get(int(req_frames[ti]))
+            if span is None:
+                continue
+            lo, hi = span
+            pids = self.player_ids[lo:hi]
+            if pids.size == 0:
+                continue
+            vis = self.visible[lo:hi]
+            sorter = np.argsort(pids, kind="stable")
+            sorted_pids = pids[sorter]
+            pos = np.searchsorted(sorted_pids, req_players)
+            in_range = pos < sorted_pids.shape[0]
+            pos_clipped = np.where(in_range, pos, 0)
+            matched_local = sorter[pos_clipped]  # row index within [lo:hi]
+            found = in_range & (pids[matched_local] == req_players)
+            rows_ok = found & vis[matched_local]
+            if not rows_ok.any():
+                continue
+            sel_players = np.nonzero(rows_ok)[0]
+            sel_rows = lo + matched_local[sel_players]
+            out[ti, sel_players] = self.features[sel_rows]
+            valid[ti, sel_players] = True
         return out, valid
 
 

@@ -17,12 +17,19 @@ where to add them.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence, Union
+from typing import Any, Callable, Iterable, Iterator, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+
+try:  # DataLoader is only needed for the multi-worker provider below.
+    from torch.utils.data import DataLoader, Sampler
+except Exception:  # pragma: no cover - keeps the module importable without torch.utils
+    DataLoader = None  # type: ignore[assignment,misc]
+    Sampler = object  # type: ignore[assignment,misc]
 
 from pcspot.data.schema import StackedSample
 from pcspot.data.targets import (
@@ -48,6 +55,16 @@ from pcspot.models.pipeline import (
 # ``pcspot.data.sampling.build_dataset_batch_provider``).
 BatchProvider = Callable[[int], Iterable[Sequence[StackedSample]]]
 TrainInput = Union[Sequence[StackedSample], BatchProvider]
+
+# A "collated" batch is a ``(StackedSampleBatch, BatchTargets)`` pair that has
+# already been padded/stacked and had its CALF + objectness targets built --
+# typically inside ``DataLoader`` worker processes via ``collate_with_targets``.
+# A ``CollatedBatchProvider`` yields these pairs so ``Trainer`` only has to move
+# tensors to the device and run forward/backward on the main thread. Providers
+# of this kind carry a ``yields_collated = True`` attribute so ``fit`` can route
+# them to ``train_epoch_from_collated``.
+CollatedBatch = Tuple["StackedSampleBatch", "BatchTargets"]
+CollatedBatchProvider = Callable[[int], Iterable[CollatedBatch]]
 
 
 @dataclass
@@ -142,6 +159,144 @@ def make_full_targets_for_batch(
     )
 
 
+def collate_with_targets(
+    items: Sequence[tuple[StackedSample, Any]],
+) -> CollatedBatch:
+    """Collate ``(StackedSample, SampleTargets)`` items into a batch + targets.
+
+    This is the ``collate_fn`` used by the multi-worker DataLoader path. It
+    runs inside worker processes, so the padding/stacking (``stacked_to_batch``)
+    and the per-window CALF/objectness target stacking happen off the main
+    thread and overlap with GPU compute.
+
+    Each item is the tuple returned by ``PCBASDataset.__getitem__`` --
+    ``(StackedSample, SampleTargets | None)``. When targets are present they
+    are duck-typed (``.class_targets`` etc.) so this does not need to import
+    the dataset module. When the dataset was built with ``compute_targets=
+    False`` the second element is ``None`` and a ``ValueError`` is raised,
+    because training requires targets.
+    """
+    if not items:
+        raise ValueError("collate_with_targets received an empty batch")
+    samples = [it[0] for it in items]
+    batch = stacked_to_batch(samples)
+    if any(it[1] is None for it in items):
+        raise ValueError(
+            "collate_with_targets requires per-item targets; build the "
+            "dataset with compute_targets=True for the DataLoader path."
+        )
+    per_t = [it[1].class_targets for it in items]
+    per_w = [it[1].class_weights for it in items]
+    per_ot = [it[1].objectness_targets for it in items]
+    per_ow = [it[1].objectness_weights for it in items]
+    t_b, w_b = stack_pc_calf_targets(per_t, per_w)
+    ot_b, ow_b = stack_objectness_targets(per_ot, per_ow)
+    targets = BatchTargets(
+        class_targets=torch.from_numpy(t_b),
+        class_weights=torch.from_numpy(w_b),
+        objectness_targets=torch.from_numpy(ot_b),
+        objectness_weights=torch.from_numpy(ow_b),
+    )
+    return batch, targets
+
+
+class _ReseedingSampler(Sampler):  # type: ignore[misc]
+    """Sampler that rebuilds its index stream from a per-epoch factory.
+
+    A single ``DataLoader`` is built once and reused across epochs (so
+    ``persistent_workers`` keeps workers alive). Before each epoch the caller
+    invokes :meth:`set_epoch`; ``DataLoader`` then calls ``iter(sampler)`` and
+    we draw a fresh index order from ``factory(epoch)``. This mirrors the
+    ``DistributedSampler.set_epoch`` pattern and keeps all seeding logic in the
+    main process so reproducibility is unaffected by the worker count.
+    """
+
+    def __init__(
+        self,
+        factory: Callable[[int], Iterable[int]],
+        *,
+        epoch: int = 0,
+    ) -> None:
+        self._factory = factory
+        self._epoch = int(epoch)
+        self._len: int | None = None
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self._factory(self._epoch))
+
+    def __len__(self) -> int:
+        # Our samplers emit a fixed number of indices per epoch, so caching
+        # the first measured length is safe and avoids rebuilding the sampler
+        # just to answer len(). Prefer the cheap ``len()`` when the factory
+        # output is sized (range / our Sampler subclasses) and only fall back
+        # to consuming the iterator otherwise.
+        if self._len is None:
+            obj = self._factory(self._epoch)
+            try:
+                self._len = len(obj)  # type: ignore[arg-type]
+            except TypeError:
+                self._len = sum(1 for _ in obj)
+        return self._len
+
+
+def build_collated_dataloader_provider(
+    dataset: Any,
+    *,
+    sampler_factory: Callable[[int], Iterable[int]],
+    batch_size: int,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    prefetch_factor: int = 4,
+    persistent_workers: bool = True,
+    drop_last: bool = False,
+) -> CollatedBatchProvider:
+    """Wrap a dataset + sampler in a multi-worker ``DataLoader`` provider.
+
+    The returned callable takes an epoch and yields ``(StackedSampleBatch,
+    BatchTargets)`` pairs collated by :func:`collate_with_targets` -- i.e. the
+    padding, visual-feature alignment, and CALF/objectness target building are
+    all performed in worker processes and prefetched, so the main thread is
+    left to do little more than move tensors to the GPU and launch the
+    forward/backward.
+
+    ``dataset`` must yield ``(StackedSample, SampleTargets)`` items, so build
+    it with ``compute_targets=True``. ``sampler_factory(epoch)`` must return an
+    iterable of integer indices (e.g. ``MixedEventSampler`` or ``range(n)``).
+    """
+    if DataLoader is None:  # pragma: no cover - torch.utils missing
+        raise RuntimeError(
+            "torch.utils.data.DataLoader is unavailable; cannot build the "
+            "multi-worker provider."
+        )
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    num_workers = max(0, int(num_workers))
+
+    sampler = _ReseedingSampler(sampler_factory)
+    loader_kwargs: dict[str, Any] = dict(
+        batch_size=int(batch_size),
+        sampler=sampler,
+        num_workers=num_workers,
+        collate_fn=collate_with_targets,
+        pin_memory=bool(pin_memory),
+        drop_last=bool(drop_last),
+    )
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+    loader = DataLoader(dataset, **loader_kwargs)
+
+    def _provider(epoch: int) -> Iterable[CollatedBatch]:
+        sampler.set_epoch(int(epoch))
+        return loader
+
+    _provider.yields_collated = True  # type: ignore[attr-defined]
+    return _provider
+
+
 class WarmupCosineSchedule:
     """Linear warmup -> cosine decay, returns a multiplier on ``base_lr``.
 
@@ -197,8 +352,15 @@ class Trainer:
         grad_accum_steps: int = 1,
         amp_enabled: bool = False,
         amp_dtype: str = "bf16",
+        compile: bool = False,
     ) -> None:
         self.model = model.to(device)
+        # Keep a handle to the original (uncompiled) module. ``torch.compile``
+        # wraps the model in an ``OptimizedModule`` whose ``state_dict`` keys
+        # carry an ``_orig_mod.`` prefix; checkpointing through the uncompiled
+        # module keeps saved weights compatible regardless of whether the run
+        # used compilation.
+        self._uncompiled_model = self.model
         self.optim = torch.optim.AdamW(
             self.model.parameters(), lr=learning_rate, weight_decay=weight_decay
         )
@@ -249,6 +411,33 @@ class Trainer:
             # the canonical entry point.
             self.scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)  # type: ignore[attr-defined]
 
+        # Optional graph compilation. The optimizer above was built from the
+        # uncompiled parameters on purpose -- ``torch.compile`` shares the same
+        # parameter tensors, so the optimizer stays valid. Compilation is
+        # best-effort: if the toolchain is unavailable we warn and fall back to
+        # eager mode rather than failing the run.
+        self.compiled = False
+        if compile:
+            compile_fn = getattr(torch, "compile", None)
+            if compile_fn is None:
+                warnings.warn(
+                    "compile=True but torch.compile is unavailable; "
+                    "running in eager mode.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                try:
+                    self.model = compile_fn(self._uncompiled_model)
+                    self.compiled = True
+                except Exception as exc:  # pragma: no cover - backend specific
+                    warnings.warn(
+                        f"torch.compile failed ({exc}); running in eager mode.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    self.model = self._uncompiled_model
+
     @property
     def global_step(self) -> int:
         return self._global_step
@@ -258,17 +447,25 @@ class Trainer:
         return self._epoch
 
     def _move_batch(self, batch: StackedSampleBatch) -> StackedSampleBatch:
+        # ``non_blocking=True`` overlaps the host->device copy with compute when
+        # the source tensors are pinned (the multi-worker DataLoader path sets
+        # ``pin_memory=True``); it is a harmless no-op for pageable tensors.
+        nb = self.device.type == "cuda"
+
+        def _to(t: torch.Tensor) -> torch.Tensor:
+            return t.to(self.device, non_blocking=nb)
+
         def _opt(t: torch.Tensor | None) -> torch.Tensor | None:
-            return t.to(self.device) if t is not None else None
+            return _to(t) if t is not None else None
 
         return StackedSampleBatch(
-            pitch_xy=batch.pitch_xy.to(self.device),
-            velocity=batch.velocity.to(self.device),
-            bbox=batch.bbox.to(self.device),
-            roles=batch.roles.to(self.device),
-            teams=batch.teams.to(self.device),
-            valid_mask=batch.valid_mask.to(self.device),
-            targets_class=batch.targets_class.to(self.device),
+            pitch_xy=_to(batch.pitch_xy),
+            velocity=_to(batch.velocity),
+            bbox=_to(batch.bbox),
+            roles=_to(batch.roles),
+            teams=_to(batch.teams),
+            valid_mask=_to(batch.valid_mask),
+            targets_class=_to(batch.targets_class),
             global_features=_opt(batch.global_features),
             acceleration=_opt(batch.acceleration),
             time_features=_opt(batch.time_features),
@@ -314,6 +511,27 @@ class Trainer:
                 continue
             yield self.train_step(chunk)
 
+    def train_epoch_from_collated(
+        self,
+        batches: Iterable[CollatedBatch],
+    ) -> Iterable[TrainStepLog]:
+        """Run one training epoch from pre-collated ``(batch, targets)`` pairs.
+
+        Use this with :func:`build_collated_dataloader_provider`, whose worker
+        processes perform the padding and target construction. The trainer only
+        moves tensors to the device and runs forward/backward, so the host loop
+        stops being the bottleneck on multi-core machines.
+        """
+        self.model.train()
+        for item in batches:
+            batch, tgt = item
+            if tgt is None:
+                raise ValueError(
+                    "collated batches must carry targets; build the dataset "
+                    "with compute_targets=True."
+                )
+            yield self.train_step_collated(batch, tgt)
+
     def _autocast_ctx(self):
         if not self.amp_enabled:
             return _NullContext()
@@ -329,26 +547,49 @@ class Trainer:
             return _NullContext()
 
     def train_step(self, chunk: Sequence[StackedSample]) -> TrainStepLog:
-        """Run one micro-batch.
+        """Run one micro-batch from raw ``StackedSample`` instances.
 
         With ``grad_accum_steps == 1`` (default) this matches the legacy
         behavior. With ``grad_accum_steps > 1`` the loss is divided by
         ``grad_accum_steps`` and the optimizer only steps every Nth
         call, so the effective batch is ``batch_size * grad_accum_steps``
         without the memory cost.
+
+        This path builds the batch and targets on the calling thread. For the
+        multi-worker pipeline use :meth:`train_step_collated`, which consumes
+        batches/targets already prepared in DataLoader workers.
         """
-        self.model.train()
         batch = stacked_to_batch(list(chunk))
         tgt = make_full_targets_for_batch(
             chunk,
             config=self.calf_config,
             num_classes=self.model.num_classes,
         )
+        return self._train_on_batch(batch, tgt)
+
+    def train_step_collated(
+        self, batch: StackedSampleBatch, tgt: BatchTargets
+    ) -> TrainStepLog:
+        """Run one micro-batch from a pre-collated batch + targets pair.
+
+        ``batch`` and ``tgt`` are produced by :func:`collate_with_targets`
+        (typically inside DataLoader workers). The only work left for the
+        caller's thread is moving tensors to the device and the
+        forward/backward, so the CPU-side padding and target construction no
+        longer serialise against GPU compute.
+        """
+        return self._train_on_batch(batch, tgt)
+
+    def _train_on_batch(
+        self, batch: StackedSampleBatch, tgt: BatchTargets
+    ) -> TrainStepLog:
+        self.model.train()
         batch = self._move_batch(batch)
-        class_targets = tgt.class_targets.to(self.device)
-        class_weights = tgt.class_weights.to(self.device)
-        obj_targets = tgt.objectness_targets.to(self.device)
-        obj_weights = tgt.objectness_weights.to(self.device)
+        nb = self.device.type == "cuda"
+        class_targets = tgt.class_targets.to(self.device, non_blocking=nb)
+        class_weights = tgt.class_weights.to(self.device, non_blocking=nb)
+        obj_targets = tgt.objectness_targets.to(self.device, non_blocking=nb)
+        obj_weights = tgt.objectness_weights.to(self.device, non_blocking=nb)
 
         lr = self._apply_schedule()
         if self._accum_counter == 0:
@@ -432,8 +673,10 @@ class Trainer:
         epoch_logs: list[EpochLog] = []
         best_value: float | None = None
         provider: BatchProvider | None = None
+        provider_is_collated = False
         if callable(samples) and not isinstance(samples, (list, tuple)):
             provider = samples  # type: ignore[assignment]
+            provider_is_collated = bool(getattr(samples, "yields_collated", False))
 
         first_epoch = (
             int(start_epoch) if start_epoch is not None else int(self._epoch)
@@ -444,10 +687,12 @@ class Trainer:
             totals = {"total": 0.0, "bce": 0.0, "tmse": 0.0, "obj": 0.0}
             last_lr = 0.0
             step_count = 0
-            if provider is not None:
-                step_iter: Iterable[TrainStepLog] = self.train_epoch_from_batches(
-                    provider(ep)
+            if provider is not None and provider_is_collated:
+                step_iter: Iterable[TrainStepLog] = self.train_epoch_from_collated(
+                    provider(ep)  # type: ignore[arg-type]
                 )
+            elif provider is not None:
+                step_iter = self.train_epoch_from_batches(provider(ep))
             else:
                 step_iter = self.train_epoch(
                     samples,  # type: ignore[arg-type]
@@ -498,7 +743,10 @@ class Trainer:
 
     def save_checkpoint(self, path: str | Path) -> None:
         payload = {
-            "model_state": self.model.state_dict(),
+            # Save through the uncompiled module so keys never carry the
+            # ``_orig_mod.`` prefix torch.compile adds; checkpoints stay
+            # interchangeable between compiled and eager runs.
+            "model_state": self._uncompiled_model.state_dict(),
             "optim_state": self.optim.state_dict(),
             "global_step": self._global_step,
             "epoch": self._epoch,
@@ -513,7 +761,7 @@ class Trainer:
             payload: dict[str, Any] = torch.load(str(path), map_location=self.device, weights_only=True)  # type: ignore[call-arg]
         except TypeError:
             payload = torch.load(str(path), map_location=self.device)
-        self.model.load_state_dict(payload["model_state"])
+        self._uncompiled_model.load_state_dict(payload["model_state"])
         if load_optim and "optim_state" in payload:
             self.optim.load_state_dict(payload["optim_state"])
         self._global_step = int(payload.get("global_step", 0))

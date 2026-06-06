@@ -77,7 +77,13 @@ from pcspot.data.targets import CalfConfig
 from pcspot.eval.metrics import average_map_at_tolerances
 from pcspot.eval.nms import Prediction, decode_predictions, player_centric_nms
 from pcspot.models.pipeline import PlayerCentricSpottingModel, stacked_to_batch
-from pcspot.train.trainer import EpochLog, Trainer, TrainStepLog, WarmupCosineSchedule
+from pcspot.train.trainer import (
+    EpochLog,
+    Trainer,
+    TrainStepLog,
+    WarmupCosineSchedule,
+    build_collated_dataloader_provider,
+)
 
 
 # A large offset added per-half during validation to disambiguate
@@ -648,6 +654,11 @@ _KNOWN_TRAIN_KEYS = {
     "grad_accum_steps",
     "amp",
     "amp_dtype",
+    "num_workers",
+    "prefetch_factor",
+    "persistent_workers",
+    "pin_memory",
+    "compile",
     "use_zone_nodes",
     "zone_grid",
     "use_jersey",
@@ -812,7 +823,7 @@ def _build_argparser(defaults: Optional[dict[str, Any]] = None) -> argparse.Argu
     p.add_argument("--window-size", type=int, default=_df("window_size", 128))
     p.add_argument("--stride", type=int, default=_df("stride", 96))
     p.add_argument("--epochs", type=int, default=_df("epochs", 5))
-    p.add_argument("--batch-size", type=int, default=_df("batch_size", 4))
+    p.add_argument("--batch-size", type=int, default=_df("batch_size", 16))
     p.add_argument("--learning-rate", type=float, default=_df("learning_rate", 1e-3))
     p.add_argument("--weight-decay", type=float, default=_df("weight_decay", 1e-4))
     p.add_argument("--warmup-steps", type=int, default=_df("warmup_steps", 50))
@@ -919,6 +930,51 @@ def _build_argparser(defaults: Optional[dict[str, Any]] = None) -> argparse.Argu
         default=_df("amp_dtype", "bf16"),
         choices=["bf16", "fp16"],
         help="Autocast dtype when --amp is set. bf16 is preferred on Ampere+.",
+    )
+    accel_group.add_argument(
+        "--num-workers",
+        type=int,
+        default=_df("num_workers", 0),
+        help=(
+            "DataLoader worker processes for sample/target preparation. "
+            "0 (default) keeps the legacy single-process loop; >0 moves "
+            "padding, visual-feature alignment, and CALF/objectness target "
+            "building off the main thread so they overlap with GPU compute. "
+            "4-8 typically saturates this pipeline."
+        ),
+    )
+    accel_group.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=_df("prefetch_factor", 4),
+        help="Batches prefetched per worker (only used when --num-workers > 0).",
+    )
+    accel_group.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=_df("persistent_workers", True),
+        help=(
+            "Keep DataLoader workers alive across epochs (avoids re-spawning; "
+            "matters most on Windows spawn). Only used with --num-workers > 0."
+        ),
+    )
+    accel_group.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=_df("pin_memory", None),
+        help=(
+            "Pin host memory for faster async host->device copies. Defaults to "
+            "on when training on CUDA, off otherwise."
+        ),
+    )
+    accel_group.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=_df("compile", False),
+        help=(
+            "Wrap the model in torch.compile for higher GPU utilisation. "
+            "Best-effort: falls back to eager mode if compilation fails."
+        ),
     )
     p.add_argument(
         "--objectness",
@@ -1202,18 +1258,38 @@ def run(args: argparse.Namespace, *, wandb_run: Any = None) -> int:
         print("No training windows in the manifest. Aborting.", file=sys.stderr)
         return 1
 
-    # Sampler dispatch. 'sequential' preserves the legacy materialise-once
-    # behavior; 'mixed'/'uniform' use the dataset+sampler+BatchProvider
-    # path so the full window list never needs to live in memory at once
-    # and event-bearing windows can be oversampled.
+    # Sampler dispatch. Each mode produces a per-epoch index ``sampler_factory``.
+    # With --num-workers 0 (default) the legacy paths run: 'sequential'
+    # materialises every window once; 'mixed'/'uniform' stream batches through
+    # build_dataset_batch_provider so the full window list never lives in memory
+    # at once. With --num-workers > 0 every mode is routed through the
+    # multi-worker collated DataLoader provider, which performs the padding,
+    # visual-feature alignment, and CALF/objectness target building in worker
+    # processes so they overlap with GPU compute instead of stalling one core.
     sampler_mode = str(args.sampler).lower()
     samples: list = []
     batch_provider = None
+    sampler_factory: Optional[Callable[[int], object]] = None
     samples_per_epoch = int(args.samples_per_epoch) if args.samples_per_epoch else None
+    num_workers = max(0, int(args.num_workers))
+    use_dataloader = num_workers > 0
+    pin_memory = (
+        str(args.device).startswith("cuda")
+        if args.pin_memory is None
+        else bool(args.pin_memory)
+    )
+
     if sampler_mode == "sequential":
-        print("Materialising training samples (sampler=sequential) ...")
-        samples = _materialize_samples(ds_train)
-        n_per_epoch = len(samples)
+        n_per_epoch = len(ds_train)
+        if use_dataloader:
+            _n = len(ds_train)
+            def _sequential_factory(epoch: int, _n: int = _n) -> range:
+                return range(_n)
+            sampler_factory = _sequential_factory
+        else:
+            print("Materialising training samples (sampler=sequential) ...")
+            samples = _materialize_samples(ds_train)
+            n_per_epoch = len(samples)
     elif sampler_mode == "mixed":
         if samples_per_epoch is None:
             samples_per_epoch = len(ds_train)
@@ -1224,33 +1300,53 @@ def run(args: argparse.Namespace, *, wandb_run: Any = None) -> int:
             num_samples=int(samples_per_epoch),
             base_seed=args.sampler_seed,
         )
-        batch_provider = build_dataset_batch_provider(
-            ds_train,
-            sampler_factory=sampler_factory,
-            batch_size=int(args.batch_size),
-        )
         n_per_epoch = int(samples_per_epoch)
         print(
             f"  Sampler: mixed positive_ratio={args.positive_ratio} "
             f"weighting={args.event_weighting} samples_per_epoch={n_per_epoch}"
         )
+        if not use_dataloader:
+            batch_provider = build_dataset_batch_provider(
+                ds_train,
+                sampler_factory=sampler_factory,
+                batch_size=int(args.batch_size),
+            )
     elif sampler_mode == "uniform":
         from pcspot.data.sampling import UniformWindowSampler
         if samples_per_epoch is None:
             samples_per_epoch = len(ds_train)
         def _uniform_factory(epoch: int):
             return UniformWindowSampler(num_items=int(samples_per_epoch))  # type: ignore[arg-type]
-        batch_provider = build_dataset_batch_provider(
-            ds_train,
-            sampler_factory=_uniform_factory,
-            batch_size=int(args.batch_size),
-        )
+        sampler_factory = _uniform_factory
         n_per_epoch = int(samples_per_epoch)
         print(f"  Sampler: uniform samples_per_epoch={n_per_epoch}")
+        if not use_dataloader:
+            batch_provider = build_dataset_batch_provider(
+                ds_train,
+                sampler_factory=sampler_factory,
+                batch_size=int(args.batch_size),
+            )
     else:
         # argparse choices keep this unreachable; defensive guard.
         print(f"Unknown --sampler {sampler_mode!r}", file=sys.stderr)
         return 2
+
+    if use_dataloader:
+        batch_provider = build_collated_dataloader_provider(
+            ds_train,
+            sampler_factory=sampler_factory,  # type: ignore[arg-type]
+            batch_size=int(args.batch_size),
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=int(args.prefetch_factor),
+            persistent_workers=bool(args.persistent_workers),
+        )
+        print(
+            f"  DataLoader: num_workers={num_workers} "
+            f"prefetch_factor={args.prefetch_factor} "
+            f"persistent_workers={bool(args.persistent_workers)} "
+            f"pin_memory={pin_memory}"
+        )
 
     val_dataset: Optional[PCBASDataset] = None
     val_gt_per_half: dict[tuple[str, str], list[EventLabel]] = {}
@@ -1334,6 +1430,7 @@ def run(args: argparse.Namespace, *, wandb_run: Any = None) -> int:
         grad_accum_steps=int(args.grad_accum_steps),
         amp_enabled=bool(args.amp),
         amp_dtype=str(args.amp_dtype),
+        compile=bool(args.compile),
     )
 
     if args.resume is not None:
