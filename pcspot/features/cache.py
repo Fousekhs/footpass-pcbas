@@ -94,6 +94,22 @@ class _ShardIndex:
     visible: np.ndarray
     # frame -> slice into the row arrays (rows for that frame).
     frame_starts: dict[int, tuple[int, int]]
+    # Maps a position in the (frame-sorted) lookup order to the row index in
+    # ``features``. ``None`` means ``features`` is already in sorted order
+    # (the eager ``from_arrays`` path) so position == row. The lazy memmap
+    # path keeps ``features`` in its on-disk order and resolves rows through
+    # this map, so only the rows a window touches are ever paged in.
+    sorted_to_row: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _build_starts(sorted_frames: np.ndarray) -> dict[int, tuple[int, int]]:
+        starts: dict[int, tuple[int, int]] = {}
+        if sorted_frames.size:
+            unique, idx = np.unique(sorted_frames, return_index=True)
+            ends = np.append(idx[1:], sorted_frames.size)
+            for f, lo, hi in zip(unique.tolist(), idx.tolist(), ends.tolist()):
+                starts[int(f)] = (int(lo), int(hi))
+        return starts
 
     @classmethod
     def from_arrays(
@@ -112,18 +128,43 @@ class _ShardIndex:
         player_ids = player_ids[order]
         features = features[order]
         visible = visible[order]
-        starts: dict[int, tuple[int, int]] = {}
-        if frames.size:
-            unique, idx = np.unique(frames, return_index=True)
-            ends = np.append(idx[1:], frames.size)
-            for f, lo, hi in zip(unique.tolist(), idx.tolist(), ends.tolist()):
-                starts[int(f)] = (int(lo), int(hi))
         return cls(
             frames=frames.astype(np.int64, copy=False),
             player_ids=player_ids.astype(np.int64, copy=False),
             features=features.astype(np.float32, copy=False),
             visible=visible.astype(bool, copy=False),
-            frame_starts=starts,
+            frame_starts=cls._build_starts(frames),
+        )
+
+    @classmethod
+    def from_mmap(
+        cls,
+        *,
+        features: np.ndarray,
+        frames: np.ndarray,
+        player_ids: np.ndarray,
+        visible: np.ndarray,
+    ) -> "_ShardIndex":
+        """Build an index that keeps ``features`` lazy (e.g. a ``np.memmap``).
+
+        Only the small per-row arrays are sorted/materialised; ``features``
+        stays in its on-disk order and is indexed lazily during lookups via
+        ``sorted_to_row``. This is what keeps random-access windows from
+        paging in an entire match-half.
+        """
+        if not (frames.ndim == player_ids.ndim == visible.ndim == 1):
+            raise ValueError("frames/player_ids/visible must be 1D")
+        if frames.shape[0] != features.shape[0]:
+            raise ValueError("frames and features must have same N")
+        order = np.argsort(frames, kind="stable").astype(np.int64, copy=False)
+        sorted_frames = frames[order].astype(np.int64, copy=False)
+        return cls(
+            frames=sorted_frames,
+            player_ids=player_ids[order].astype(np.int64, copy=False),
+            features=features,  # left lazy (memmap), original row order
+            visible=visible[order].astype(bool, copy=False),
+            frame_starts=cls._build_starts(sorted_frames),
+            sorted_to_row=order,
         )
 
     def lookup(self, frame: int, player_id: int) -> np.ndarray | None:
@@ -135,9 +176,11 @@ class _ShardIndex:
         idx = np.where(pids == int(player_id))[0]
         if idx.size == 0:
             return None
-        if not bool(self.visible[lo + int(idx[0])]):
+        pos = lo + int(idx[0])
+        if not bool(self.visible[pos]):
             return None
-        return self.features[lo + int(idx[0])]
+        row = pos if self.sorted_to_row is None else int(self.sorted_to_row[pos])
+        return self.features[row]
 
     def lookup_window(
         self,
@@ -186,7 +229,10 @@ class _ShardIndex:
                 continue
             sel_players = np.nonzero(rows_ok)[0]
             sel_rows = lo + matched_local[sel_players]
-            out[ti, sel_players] = self.features[sel_rows]
+            if self.sorted_to_row is not None:
+                sel_rows = self.sorted_to_row[sel_rows]
+            # Fancy-indexing a memmap pages in only these rows.
+            out[ti, sel_players] = np.asarray(self.features[sel_rows])
             valid[ti, sel_players] = True
         return out, valid
 
@@ -334,11 +380,30 @@ class VisualFeatureCache:
     def shard_path(self, match_id: str, half_id: str) -> Path:
         return self.root / f"{_shard_basename(match_id, half_id)}.npz"
 
-    def _shard(self, match_id: str, half_id: str) -> _ShardIndex:
-        key = (str(match_id), str(half_id))
-        if key in self._lru:
-            self._lru.move_to_end(key)
-            return self._lru[key]
+    def features_path(self, match_id: str, half_id: str) -> Path:
+        """Path to the uncompressed, memmap-able features array (if converted)."""
+        return self.root / f"{_shard_basename(match_id, half_id)}.features.npy"
+
+    def meta_path(self, match_id: str, half_id: str) -> Path:
+        """Path to the small per-row metadata sidecar for the memmap layout."""
+        return self.root / f"{_shard_basename(match_id, half_id)}.meta.npz"
+
+    def _load_shard(self, match_id: str, half_id: str) -> _ShardIndex:
+        # Preferred path: uncompressed features.npy memmapped + small meta
+        # sidecar. Reading a window pages in only the rows it touches instead
+        # of decompressing the whole match-half.
+        feat_path = self.features_path(match_id, half_id)
+        meta_path = self.meta_path(match_id, half_id)
+        if feat_path.exists() and meta_path.exists():
+            features = np.load(feat_path, mmap_mode="r")
+            with np.load(meta_path) as meta:
+                return _ShardIndex.from_mmap(
+                    features=features,
+                    frames=meta["frames"][:],
+                    player_ids=meta["player_ids"][:],
+                    visible=meta["visible"][:],
+                )
+        # Legacy path: a single compressed .npz (decompressed in full).
         path = self.shard_path(match_id, half_id)
         if not path.exists():
             raise FileNotFoundError(
@@ -346,18 +411,30 @@ class VisualFeatureCache:
                 "precompute script for this match-half?"
             )
         with np.load(path) as data:
-            shard = _ShardIndex.from_arrays(
+            return _ShardIndex.from_arrays(
                 frames=data["frames"][:],
                 player_ids=data["player_ids"][:],
                 features=data["features"][:],
                 visible=data["visible"][:],
             )
+
+    def _shard(self, match_id: str, half_id: str) -> _ShardIndex:
+        key = (str(match_id), str(half_id))
+        if key in self._lru:
+            self._lru.move_to_end(key)
+            return self._lru[key]
+        shard = self._load_shard(match_id, half_id)
         self._lru[key] = shard
         if len(self._lru) > self._capacity:
             self._lru.popitem(last=False)
         return shard
 
     def has_shard(self, match_id: str, half_id: str) -> bool:
+        if (
+            self.features_path(match_id, half_id).exists()
+            and self.meta_path(match_id, half_id).exists()
+        ):
+            return True
         return self.shard_path(match_id, half_id).exists()
 
     def get_window(

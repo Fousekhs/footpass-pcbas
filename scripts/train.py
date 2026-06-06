@@ -111,10 +111,12 @@ def _load_output_dir(config_path: Path) -> Path:
     return out
 
 
-def _make_visual_cache(root: Path, backbone: str):
+def _make_visual_cache(root: Path, backbone: str, lru_capacity: int = 8):
     from pcspot.features.cache import VisualFeatureCache
 
-    return VisualFeatureCache(root=root, backbone_name=backbone)
+    return VisualFeatureCache(
+        root=root, backbone_name=backbone, lru_capacity=max(1, int(lru_capacity))
+    )
 
 
 def _materialize_samples(dataset: PCBASDataset):
@@ -691,6 +693,7 @@ _KNOWN_TRAIN_KEYS = {
     "num_mstcn_layers",
     "visual_dim",
     "visual_backbone",
+    "visual_cache_capacity",
     "device",
     "seed",
     "sampler",
@@ -1068,6 +1071,18 @@ def _build_argparser(defaults: Optional[dict[str, Any]] = None) -> argparse.Argu
     p.add_argument("--visual-dim", type=int, default=_df("visual_dim", 0),
                    help="Visual feature dim; must match the cache (DINOv2 ViT-S/14 = 384).")
     p.add_argument(
+        "--visual-cache-capacity",
+        type=int,
+        default=_df("visual_cache_capacity", 8),
+        help=(
+            "How many match-half shard indices to keep resident per worker. "
+            "Raise it (e.g. to the number of halves) when using random "
+            "(--sampler mixed/uniform) sampling so shards are not re-opened "
+            "every window. With the memmap cache layout each resident shard "
+            "costs only its small per-row index, not the features."
+        ),
+    )
+    p.add_argument(
         "--target-cache",
         type=Path,
         default=None,
@@ -1444,7 +1459,11 @@ def run(args: argparse.Namespace, *, wandb_run: Any = None) -> int:
 
     visual_cache = None
     if args.visual_cache is not None:
-        visual_cache = _make_visual_cache(args.visual_cache, args.visual_backbone)
+        visual_cache = _make_visual_cache(
+            args.visual_cache,
+            args.visual_backbone,
+            lru_capacity=int(args.visual_cache_capacity),
+        )
         print(f"  Visual cache: {args.visual_cache} (backbone={args.visual_backbone})")
         try:
             cache_dim = int(visual_cache.feature_dim())

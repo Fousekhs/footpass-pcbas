@@ -122,6 +122,13 @@ def _build_sweep_argparser() -> argparse.ArgumentParser:
                    help="Windows drawn per epoch for mixed/uniform samplers.")
     p.add_argument("--batch-size", type=int, default=None,
                    help="Training batch size (passed through to train.py).")
+    p.add_argument("--visual-cache-capacity", type=int, default=None,
+                   help="Resident shard-index count per worker. Raise for random "
+                        "(mixed/uniform) sampling so shards are not re-opened per window.")
+    p.add_argument("--amp", action="store_true", default=False,
+                   help="Enable mixed-precision training (forwarded to train.py).")
+    p.add_argument("--amp-dtype", default=None, choices=["bf16", "fp16"],
+                   help="AMP dtype when --amp is set (bf16 recommended on Ada/Blackwell).")
 
     # Visual cache (optional, fixed across all trials)
     p.add_argument("--visual-cache", type=Path, default=None)
@@ -190,6 +197,12 @@ def _make_trial_fn(fixed: argparse.Namespace) -> Any:
                 cli += ["--samples-per-epoch", str(fixed.samples_per_epoch)]
             if fixed.batch_size is not None:
                 cli += ["--batch-size", str(fixed.batch_size)]
+            if fixed.visual_cache_capacity is not None:
+                cli += ["--visual-cache-capacity", str(fixed.visual_cache_capacity)]
+            if fixed.amp:
+                cli += ["--amp"]
+            if fixed.amp_dtype is not None:
+                cli += ["--amp-dtype", fixed.amp_dtype]
 
             args = _build_argparser(defaults=swept).parse_args(cli)
             # The wandb run is already open — tell run() not to call wandb.init() again.
