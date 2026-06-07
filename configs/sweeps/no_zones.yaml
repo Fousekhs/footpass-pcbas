@@ -1,0 +1,69 @@
+# W&B Bayesian sweep over model and training hyperparameters for the
+# player-graph (no zone nodes) model.
+#
+# Usage:
+#   # Option A – let sweep.py create the sweep and launch the agent in one step:
+#   python scripts/no_zones/sweep.py \
+#       --sweep-config configs/sweeps/no_zones.yaml \
+#       --splits data/splits.json \
+#       --output-dir checkpoints/sweeps/no_zones \
+#       --validation-split val \
+#       --keep-best-metric val/map_joint \
+#       --device cuda:0 --epochs 10 --count 20
+#
+#   # Option B – create the sweep manually first, then pass the ID:
+#   wandb sweep configs/sweeps/no_zones.yaml
+#   python scripts/no_zones/sweep.py --sweep-id <entity/project/id> ...
+#
+# The metric `val/map_joint` is the joint (player-identity-aware) mAP
+# averaged over the tolerances in --metric-tolerances.  Set
+# --validation-split and --keep-best-metric accordingly. For the full
+# model (with zone nodes), see configs/sweeps/graph.yaml; for the
+# no-graph ablation, see configs/sweeps/no_graph.yaml.
+
+program: scripts/no_zones/sweep.py
+method: bayes
+
+metric:
+  name: val/map_joint
+  goal: maximize
+
+parameters:
+  # --- Optimizer ---
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.000010
+    max: 0.001
+
+  warmup_steps:
+    values: [25, 50, 100]
+
+  grad_clip:
+    values: [0.5, 1.0, 2.0]
+
+  # --- Model architecture ---
+  hidden_dim:
+    values: [64, 128, 256]
+
+  num_mstcn_stages:
+    values: [2, 3, 4]
+
+  num_mstcn_layers:
+    values: [6, 8, 10, 12]
+
+  # --- Architecture toggles ---
+  # use_jersey / use_goal_distances / use_radius_edges are deliberately
+  # NOT swept: we assume all three on (their argparse defaults) is best.
+  # Add them back here as {values: [true, false]} to run an ablation.
+  # This variant has no zone nodes, so there are no zone/grid knobs.
+
+  # --- Sampler (only relevant when --sampler mixed is set via fixed args) ---
+  positive_ratio:
+    distribution: uniform
+    min: 0.3
+    max: 0.8

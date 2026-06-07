@@ -11,6 +11,10 @@ Two subcommands, both writing the same JSON prediction layout:
   embeddings on the fly with bounded memory. Use this to mimic the
   single-pass Codabench / live-broadcast environment.
 
+Pass ``--model-variant {graph,no_graph}`` to match the architecture the
+checkpoint was trained with (default: ``graph``); this selects both the
+model class and which ``run.json`` keys are used to reconstruct it.
+
 Example::
 
     python scripts/infer.py offline \\
@@ -50,7 +54,10 @@ from pcspot.data.loader import COL_FRAME, load_halves_from_pcbas
 from pcspot.data.schema import PCBAS_CLASS_NAMES
 from pcspot.data.splits import SplitManifest
 from pcspot.eval.nms import Prediction, decode_predictions, player_centric_nms
-from pcspot.models.pipeline import PlayerCentricSpottingModel, stacked_to_batch
+from pcspot.models.graph_model import PlayerCentricSpottingModel
+from pcspot.models.no_graph_model import NoGraphSpottingModel
+from pcspot.models.no_zones_model import NoZonesSpottingModel
+from pcspot.models.pipeline import stacked_to_batch
 
 
 def _load_output_dir(config_path: Path) -> Path:
@@ -63,30 +70,91 @@ def _load_output_dir(config_path: Path) -> Path:
     return out
 
 
-_MODEL_INIT_KEYS = (
-    "hidden_dim",
-    "num_classes",
-    "num_hgt_layers",
-    "num_heads",
-    "num_mstcn_stages",
-    "num_mstcn_layers",
-    "knn",
-    "global_dim",
-    "visual_dim",
-    "visual_proj_dim",
-    "with_confidence",
-    "use_acceleration",
-    "use_time_features",
-    "use_edge_features",
-)
+# Per-variant (model class, run.json "args" keys to mine for __init__
+# kwargs). Mirrors scripts/{graph,no_zones,no_graph}/eval.py's
+# MODEL_INIT_KEYS — kept here too so this general-purpose offline/online
+# inference tool does not depend on the per-variant eval scripts.
+_MODEL_REGISTRY: dict[str, tuple[type, tuple[str, ...]]] = {
+    "graph": (
+        PlayerCentricSpottingModel,
+        (
+            "hidden_dim",
+            "num_classes",
+            "num_hgt_layers",
+            "num_heads",
+            "num_mstcn_stages",
+            "num_mstcn_layers",
+            "knn",
+            "global_dim",
+            "visual_dim",
+            "visual_proj_dim",
+            "with_confidence",
+            "use_acceleration",
+            "use_time_features",
+            "use_edge_features",
+            "use_zone_nodes",
+            "zone_grid",
+            "use_jersey",
+            "use_goal_distances",
+            "use_radius_edges",
+            "radius",
+        ),
+    ),
+    "no_zones": (
+        NoZonesSpottingModel,
+        (
+            "hidden_dim",
+            "num_classes",
+            "num_hgt_layers",
+            "num_heads",
+            "num_mstcn_stages",
+            "num_mstcn_layers",
+            "knn",
+            "global_dim",
+            "visual_dim",
+            "visual_proj_dim",
+            "with_confidence",
+            "use_acceleration",
+            "use_time_features",
+            "use_edge_features",
+            "use_jersey",
+            "use_goal_distances",
+            "use_radius_edges",
+            "radius",
+        ),
+    ),
+    "no_graph": (
+        NoGraphSpottingModel,
+        (
+            "hidden_dim",
+            "num_classes",
+            "num_mstcn_stages",
+            "num_mstcn_layers",
+            "global_dim",
+            "visual_dim",
+            "visual_proj_dim",
+            "with_confidence",
+            "use_acceleration",
+            "use_time_features",
+            "use_jersey",
+            "use_goal_distances",
+        ),
+    ),
+}
 
 
-def _resolve_model_kwargs(checkpoint_path: Path, overrides: dict) -> dict:
-    """Recover the kwargs used to construct PlayerCentricSpottingModel.
+def _resolve_model_kwargs(
+    checkpoint_path: Path,
+    overrides: dict,
+    *,
+    model_init_keys: tuple[str, ...],
+) -> dict:
+    """Recover the kwargs used to construct the checkpoint's model.
 
     Looks for ``run.json`` next to the checkpoint (written by
-    ``scripts/train.py``) and pulls the model construction args from
-    its ``args`` payload. ``overrides`` (typically CLI flags) win.
+    ``scripts/<variant>/train.py``) and pulls the model construction
+    args — restricted to ``model_init_keys`` — from its ``args``
+    payload. ``overrides`` (typically CLI flags) win.
     """
     kwargs: dict = {}
     run_json = checkpoint_path.parent / "run.json"
@@ -94,7 +162,7 @@ def _resolve_model_kwargs(checkpoint_path: Path, overrides: dict) -> dict:
         try:
             data = json.loads(run_json.read_text(encoding="utf-8"))
             train_args = data.get("args", {}) if isinstance(data, dict) else {}
-            for k in _MODEL_INIT_KEYS:
+            for k in model_init_keys:
                 if k in train_args and train_args[k] is not None:
                     kwargs[k] = train_args[k]
         except (json.JSONDecodeError, OSError):
@@ -109,7 +177,9 @@ def _make_model(
     checkpoint_path: Path,
     device: str,
     model_kwargs: dict,
-) -> PlayerCentricSpottingModel:
+    *,
+    model_cls: type,
+):
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(payload, dict) and "model_state" in payload:
         state_dict = payload["model_state"]
@@ -122,7 +192,7 @@ def _make_model(
             f"Unexpected checkpoint payload at {checkpoint_path}: "
             f"{type(payload).__name__}"
         )
-    model = PlayerCentricSpottingModel(**model_kwargs)
+    model = model_cls(**model_kwargs)
     model.load_state_dict(state_dict, strict=True)
     model.to(device).eval()
     return model
@@ -184,14 +254,15 @@ def _run_offline(args: argparse.Namespace) -> int:
     )
     print(f"Offline inference: {len(dataset)} window(s)")
 
+    model_cls, model_init_keys = _MODEL_REGISTRY[args.model_variant]
     overrides = {
         "hidden_dim": args.hidden_dim,
         "num_mstcn_stages": args.num_mstcn_stages,
         "num_mstcn_layers": args.num_mstcn_layers,
         "visual_dim": args.visual_dim,
     }
-    model_kwargs = _resolve_model_kwargs(args.checkpoint, overrides)
-    model = _make_model(args.checkpoint, args.device, model_kwargs)
+    model_kwargs = _resolve_model_kwargs(args.checkpoint, overrides, model_init_keys=model_init_keys)
+    model = _make_model(args.checkpoint, args.device, model_kwargs, model_cls=model_cls)
 
     all_preds: list[Prediction] = []
     with torch.inference_mode():
@@ -260,14 +331,15 @@ def _run_online(args: argparse.Namespace) -> int:
     from pcspot.features.dinov2 import DinoV2Config, DinoV2Extractor
     from pcspot.inference.online import OnlineInferenceConfig, OnlineSpotter
 
+    model_cls, model_init_keys = _MODEL_REGISTRY[args.model_variant]
     overrides = {
         "hidden_dim": args.hidden_dim,
         "num_mstcn_stages": args.num_mstcn_stages,
         "num_mstcn_layers": args.num_mstcn_layers,
         "visual_dim": args.visual_dim,
     }
-    model_kwargs = _resolve_model_kwargs(args.checkpoint, overrides)
-    model = _make_model(args.checkpoint, args.device, model_kwargs)
+    model_kwargs = _resolve_model_kwargs(args.checkpoint, overrides, model_init_keys=model_init_keys)
+    model = _make_model(args.checkpoint, args.device, model_kwargs, model_cls=model_cls)
     cropper = PaddedPlayerCropper(CropperConfig(crop_size=args.crop_size,
                                                 pad_factor=args.pad_factor))
     dino_cfg = DinoV2Config(
@@ -326,6 +398,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="mode", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--model-variant", choices=sorted(_MODEL_REGISTRY), default="graph",
+                        help="Which model architecture the checkpoint was trained with.")
     common.add_argument("--checkpoint", type=Path, required=True)
     common.add_argument("--config", type=Path, default=Path("config.toml"))
     common.add_argument("--match-id", required=True)
