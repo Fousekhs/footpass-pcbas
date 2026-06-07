@@ -67,6 +67,15 @@ CollatedBatch = Tuple["StackedSampleBatch", "BatchTargets"]
 CollatedBatchProvider = Callable[[int], Iterable[CollatedBatch]]
 
 
+class LossDivergedError(RuntimeError):
+    """Raised when the training loss becomes non-finite (NaN/Inf).
+
+    Lets ``Trainer.fit`` abort the run early instead of burning hours of
+    compute on a diverged model -- important for sweeps, where a stuck
+    run otherwise blocks the agent until it times out.
+    """
+
+
 @dataclass
 class TrainStepLog:
     step: int
@@ -605,6 +614,11 @@ class Trainer:
                 objectness_targets=obj_targets,
                 objectness_weights=obj_weights,
             )
+        if not torch.isfinite(loss_out.total):
+            raise LossDivergedError(
+                f"loss diverged to NaN/Inf at step {self._global_step} "
+                f"(epoch {self._epoch})"
+            )
         loss_for_backward = loss_out.total / float(self.grad_accum_steps)
         # ``scaler`` is a no-op when GradScaler is disabled (bf16 / cpu).
         self.scaler.scale(loss_for_backward).backward()
@@ -698,18 +712,28 @@ class Trainer:
                     samples,  # type: ignore[arg-type]
                     batch_size=batch_size,
                 )
-            for log in step_iter:
-                totals["total"] += log.total_loss
-                totals["bce"] += log.bce_loss
-                totals["tmse"] += log.tmse_loss
-                totals["obj"] += log.objectness_loss
-                last_lr = log.learning_rate
-                step_count += 1
-                if log_fn is not None:
-                    log_fn(log)
+            diverged = False
+            try:
+                for log in step_iter:
+                    totals["total"] += log.total_loss
+                    totals["bce"] += log.bce_loss
+                    totals["tmse"] += log.tmse_loss
+                    totals["obj"] += log.objectness_loss
+                    last_lr = log.learning_rate
+                    step_count += 1
+                    if log_fn is not None:
+                        log_fn(log)
+            except LossDivergedError as exc:
+                print(f"warning: {exc}; terminating run early")
+                diverged = True
             denom = max(step_count, 1)
             validation: dict[str, float] = {}
-            if validation_fn is not None:
+            if diverged:
+                # Report a poor score on the sweep's optimisation metric so
+                # the Bayes/Hyperband controller learns this config failed
+                # rather than treating the missing run as inconclusive.
+                validation = {"val/map_joint": 0.0}
+            elif validation_fn is not None:
                 validation = dict(validation_fn(self))
             epoch_log = EpochLog(
                 epoch=ep,
@@ -724,6 +748,9 @@ class Trainer:
             epoch_logs.append(epoch_log)
             if log_fn is not None:
                 log_fn(epoch_log)
+
+            if diverged:
+                break
 
             if checkpoint_dir is not None:
                 ckpt_dir = Path(checkpoint_dir)
