@@ -1,24 +1,27 @@
-# W&B Bayesian sweep over model and training hyperparameters.
+# W&B Bayesian sweep over model and training hyperparameters for the
+# graph-ablation variant (HGT graph encoder bypassed; tactical + visual
+# per-player inputs unchanged).
 #
 # Usage:
 #   # Option A – let sweep.py create the sweep and launch the agent in one step:
-#   python scripts/sweep.py \
-#       --sweep-config configs/sweeps/hyperparams.yaml \
+#   python scripts/no_graph/sweep.py \
+#       --sweep-config configs/sweeps/no_graph.yaml \
 #       --splits data/splits.json \
-#       --output-dir checkpoints/sweeps \
+#       --output-dir checkpoints/sweeps/no_graph \
 #       --validation-split val \
 #       --keep-best-metric val/map_joint \
 #       --device cuda:0 --epochs 10 --count 20
 #
 #   # Option B – create the sweep manually first, then pass the ID:
-#   wandb sweep configs/sweeps/hyperparams.yaml
-#   python scripts/sweep.py --sweep-id <entity/project/id> ...
+#   wandb sweep configs/sweeps/no_graph.yaml
+#   python scripts/no_graph/sweep.py --sweep-id <entity/project/id> ...
 #
 # The metric `val/map_joint` is the joint (player-identity-aware) mAP
 # averaged over the tolerances in --metric-tolerances.  Set
-# --validation-split and --keep-best-metric accordingly.
+# --validation-split and --keep-best-metric accordingly. For the main,
+# graph-based model, see configs/sweeps/graph.yaml.
 
-program: scripts/sweep.py
+program: scripts/no_graph/sweep.py
 method: bayes
 
 metric:
@@ -54,9 +57,11 @@ parameters:
     values: [6, 8, 10, 12]
 
   # --- Architecture toggles ---
-  # use_zone_nodes / use_jersey / use_goal_distances / use_radius_edges are
-  # deliberately NOT swept: we assume all four on (their argparse defaults) is
-  # best. Add them back here as {values: [true, false]} to run an ablation.
+  # use_jersey / use_goal_distances are deliberately NOT swept: we
+  # assume both on (their argparse defaults) is best. Add them back
+  # here as {values: [true, false]} to run an ablation. There are no
+  # zone/radius/edge knobs in this variant — the graph encoder is
+  # always bypassed.
 
   # --- Sampler (only relevant when --sampler mixed is set via fixed args) ---
   positive_ratio:

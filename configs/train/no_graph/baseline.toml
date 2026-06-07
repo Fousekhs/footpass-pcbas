@@ -1,18 +1,22 @@
-# Reusable training defaults for `scripts/train.py`.
+# Reusable training defaults for `scripts/no_graph/train.py` (the
+# graph-ablation variant — same tactical + per-player visual inputs,
+# but the HGT graph encoder is bypassed entirely).
 #
 # This file is meant to be committed: copy it to
-# `configs/train/<experiment>.toml`, tweak, and pass via
-# `--train-config configs/train/<experiment>.toml`. CLI flags always
-# override values set here, and any key omitted falls back to the
-# script's built-in default.
+# `configs/train/no_graph/<experiment>.toml`, tweak, and pass via
+# `--train-config configs/train/no_graph/<experiment>.toml`. CLI flags
+# always override values set here, and any key omitted falls back to
+# the script's built-in default.
 #
 # DO NOT put secrets in this file. The Hugging Face token and SoccerNet
 # password live in the gitignored `config.toml` (see
 # `config.example.toml`). The W&B API key belongs in the `WANDB_API_KEY`
 # environment variable or `wandb login`.
 #
-# Keys recognized below mirror the argparse flags of `scripts/train.py`.
-# Unknown sections or keys abort the run with a clear error.
+# Keys recognized below mirror the argparse flags of
+# `scripts/no_graph/train.py`. Unknown sections or keys abort the run
+# with a clear error. For the main, graph-based model, see
+# `configs/train/graph/`.
 
 [train]
 epochs = 5
@@ -35,17 +39,10 @@ num_mstcn_layers = 10
 visual_dim = 0
 visual_backbone = "dinov2_vits14"
 
-# Heterogeneous graph extensions (4090-targeted defaults). Zone nodes
-# add a count-aware view of physical congestion; radius edges and the
-# matching degree counts give the embedder a real cardinality signal
-# next to the kNN-censored `near` edge. Set to false to reproduce the
-# pre-zone architecture for ablations.
-use_zone_nodes = true
-zone_grid = "6x4"
+# Per-player feature toggles. The graph encoder is always bypassed in
+# this variant, so there are no zone/radius/edge knobs to set.
 use_jersey = true
 use_goal_distances = true
-use_radius_edges = true
-radius = 0.15
 
 # device and seed are usually per-machine / per-run; uncomment to pin.
 # device = "cuda:0"
@@ -69,6 +66,6 @@ metric_tolerances = [3, 12, 25]
 enabled = true
 project = "pcspot"
 # entity = "your-team"  # uncomment to pin a team/username
-tags = ["pcbas", "baseline"]
+tags = ["pcbas", "no-graph", "ablation"]
 # mode = "online"       # one of online | offline | disabled
 log_artifacts = true

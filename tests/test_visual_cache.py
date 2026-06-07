@@ -224,5 +224,84 @@ class AlignToStackedTests(unittest.TestCase):
             self.assertEqual(int(aligned.visual_features[1, 1].sum()), 0)
 
 
+class MmapShardLayoutTests(unittest.TestCase):
+    def test_from_mmap_matches_from_arrays(self) -> None:
+        # The lazy memmap index must agree cell-for-cell with the eager one,
+        # including when the on-disk rows are NOT in frame-sorted order.
+        rng = np.random.default_rng(11)
+        n = 40
+        frames = rng.integers(0, 8, size=n).astype(np.int64)
+        pids = rng.choice([101, 202, 303, 404], size=n).astype(np.int64)
+        # Make (frame, player) unique to match the shard invariant.
+        seen: set[tuple[int, int]] = set()
+        keep = []
+        for i in range(n):
+            key = (int(frames[i]), int(pids[i]))
+            if key in seen:
+                continue
+            seen.add(key)
+            keep.append(i)
+        frames, pids = frames[keep], pids[keep]
+        feats = rng.standard_normal((len(keep), 6)).astype(np.float32)
+        visible = rng.random(len(keep)) > 0.3
+
+        eager = _ShardIndex.from_arrays(frames, pids, feats, visible)
+        lazy = _ShardIndex.from_mmap(
+            features=feats, frames=frames, player_ids=pids, visible=visible
+        )
+        q_frames = list(range(8)) + [99]
+        q_players = [404, 101, 999, 202]
+        oe, ve = eager.lookup_window(q_frames, q_players)
+        ol, vl = lazy.lookup_window(q_frames, q_players)
+        self.assertTrue(np.array_equal(ve, vl))
+        self.assertTrue(np.allclose(oe, ol))
+
+    def test_converted_cache_reads_identically(self) -> None:
+        import importlib
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        conv = importlib.import_module("convert_visual_cache_mmap")
+
+        with tempfile.TemporaryDirectory() as td:
+            F = 5
+            store = VisualFeatureStore(td, metadata=_meta(F=F))
+            f0 = np.random.randn(2, F).astype(np.float32)
+            f1 = np.random.randn(2, F).astype(np.float32)
+            store.add_frame("m1", "h1", frame=10, player_ids=[101, 201], features=f0)
+            store.add_frame("m1", "h1", frame=11, player_ids=[101, 201], features=f1)
+            store.flush()
+            backbone_dir = Path(td) / "dinov2_vits14_test"
+
+            # Baseline read from the legacy compressed shard.
+            legacy = VisualFeatureCache(td, backbone_name="dinov2_vits14_test")
+            base_out, base_valid = legacy.get_window("m1", "h1", [10, 11], [101, 201])
+
+            # Convert in place, then read again -- the reader must now prefer
+            # the memmap layout and return identical values.
+            rc = conv.main([
+                "--cache-root", td,
+                "--backbone", "dinov2_vits14_test",
+            ])
+            self.assertEqual(rc, 0)
+            self.assertTrue((backbone_dir / "m1__h1.features.npy").exists())
+            self.assertTrue((backbone_dir / "m1__h1.meta.npz").exists())
+
+            converted = VisualFeatureCache(td, backbone_name="dinov2_vits14_test")
+            self.assertTrue(converted.has_shard("m1", "h1"))
+            out, valid = converted.get_window("m1", "h1", [10, 11], [101, 201])
+            self.assertTrue(np.array_equal(base_valid, valid))
+            self.assertTrue(np.allclose(base_out, out))
+            self.assertTrue(np.allclose(out[0, 0], f0[0]))
+            self.assertTrue(np.allclose(out[1, 1], f1[1]))
+
+            # Release the memmap so the TemporaryDirectory can be cleaned on
+            # Windows (open mmaps lock the file there; harmless on POSIX).
+            import gc
+
+            converted._lru.clear()
+            del converted, legacy, out, base_out
+            gc.collect()
+
+
 if __name__ == "__main__":
     unittest.main()

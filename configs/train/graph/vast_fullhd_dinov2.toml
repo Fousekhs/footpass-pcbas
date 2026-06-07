@@ -1,0 +1,84 @@
+# Reusable training defaults for a full-quality Vast.ai GPU run of the
+# main, graph-based model (`scripts/graph/train.py`).
+#
+# Pair with:
+#
+#   scripts/mirror_pcbas_full.py    (fullHD mirror of TRAIN+VAL+CHALLENGE)
+#   scripts/precompute_visual_features.py  (DINOv2 ViT-S/14 cache)
+#
+# Typical invocation on a rented GPU:
+#
+#   python scripts/graph/train.py \
+#       --config config.toml \
+#       --train-config configs/train/graph/vast_fullhd_dinov2.toml \
+#       --splits data/splits.json \
+#       --output-dir checkpoints/vast_run1 \
+#       --visual-cache data/pcbas/visual_features \
+#       --target-cache .cache/calf \
+#       --device cuda:0 \
+#       --wandb-run-name vast_run1
+#
+# DO NOT put secrets in this file. The Hugging Face token and SoccerNet
+# password live in the gitignored config.toml; the W&B API key belongs
+# in WANDB_API_KEY or `wandb login`.
+
+[train]
+epochs = 30
+batch_size = 8
+learning_rate = 5e-4
+weight_decay = 1e-4
+warmup_steps = 500
+grad_clip = 1.0
+window_size = 128
+stride = 96
+
+# Model dims. visual_dim must match the precomputed visual cache; 384
+# is DINOv2 ViT-S/14.
+hidden_dim = 128
+num_mstcn_stages = 3
+num_mstcn_layers = 10
+visual_dim = 384
+visual_backbone = "dinov2_vits14"
+
+device = "cuda:0"
+seed = 42
+
+# Event-centered sampling: PCBAS is extremely sparse, so a uniform
+# pass over windows wastes most of the gradient budget on negatives.
+# Defaults below over-sample event-bearing windows to ~70% of the
+# minibatch while still seeing background.
+sampler = "mixed"
+positive_ratio = 0.7
+event_weighting = "linear"
+sampler_seed = 1
+# samples_per_epoch defaults to len(dataset); override to throttle a
+# single epoch if I/O dominates.
+# samples_per_epoch = 5000
+
+# Effective batch is batch_size * grad_accum_steps = 32 by default.
+# Reduce grad_accum_steps if a single GPU comfortably fits a larger
+# batch; bump it on smaller cards to keep optimization stable.
+grad_accum_steps = 4
+
+# bfloat16 autocast on Ampere+ GPUs (RTX 30/40, A100, L40, H100, etc.)
+# halves memory and roughly doubles throughput without a loss scaler.
+amp = true
+amp_dtype = "bf16"
+
+[validation]
+validation_split = "val"
+# validation_stride defaults to window_size; bump to denser coverage on
+# small val sets if needed.
+# validation_stride = 64
+decode_threshold = 0.5
+nms_radius = 12
+nms_mode = "per_player_class"
+metric_tolerances = [3, 12, 25]
+
+[wandb]
+enabled = true
+project = "pcspot"
+# entity = "your-team"
+tags = ["pcbas", "fullhd", "dinov2", "vast.ai"]
+mode = "online"
+log_artifacts = true

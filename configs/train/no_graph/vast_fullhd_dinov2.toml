@@ -1,4 +1,8 @@
-# Reusable training defaults for a full-quality Vast.ai GPU run.
+# Reusable training defaults for a full-quality Vast.ai GPU run of the
+# graph-ablation variant (`scripts/no_graph/train.py`) — same tactical
+# + per-player visual inputs as the main model, but with the HGT graph
+# encoder bypassed entirely. Pair with a `graph` run on the same data
+# to measure the added value of the graph (see `configs/train/graph/`).
 #
 # Pair with:
 #
@@ -7,15 +11,15 @@
 #
 # Typical invocation on a rented GPU:
 #
-#   python scripts/train.py \
+#   python scripts/no_graph/train.py \
 #       --config config.toml \
-#       --train-config configs/train/vast_fullhd_dinov2.toml \
+#       --train-config configs/train/no_graph/vast_fullhd_dinov2.toml \
 #       --splits data/splits.json \
-#       --output-dir checkpoints/vast_run1 \
+#       --output-dir checkpoints/vast_run1_no_graph \
 #       --visual-cache data/pcbas/visual_features \
 #       --target-cache .cache/calf \
 #       --device cuda:0 \
-#       --wandb-run-name vast_run1
+#       --wandb-run-name vast_run1_no_graph
 #
 # DO NOT put secrets in this file. The Hugging Face token and SoccerNet
 # password live in the gitignored config.toml; the W&B API key belongs
@@ -38,6 +42,11 @@ num_mstcn_stages = 3
 num_mstcn_layers = 10
 visual_dim = 384
 visual_backbone = "dinov2_vits14"
+
+# Per-player feature toggles (the only architecture knobs this variant
+# has — the graph encoder is always bypassed).
+use_jersey = true
+use_goal_distances = true
 
 device = "cuda:0"
 seed = 42
@@ -78,6 +87,6 @@ metric_tolerances = [3, 12, 25]
 enabled = true
 project = "pcspot"
 # entity = "your-team"
-tags = ["pcbas", "fullhd", "dinov2", "vast.ai"]
+tags = ["pcbas", "fullhd", "dinov2", "vast.ai", "no-graph", "ablation"]
 mode = "online"
 log_artifacts = true

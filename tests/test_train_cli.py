@@ -1,4 +1,6 @@
-"""Tests for the W&B logging and validation helpers in ``scripts/train.py``.
+"""Tests for the W&B logging and validation helpers shared via
+``pcspot.train.cli_common`` / ``pcspot.train.runner`` and wired up by
+``scripts/graph/train.py`` (the main, graph-based model variant).
 
 These tests purposely avoid any real network or W&B SDK dependency: a
 ``_FakeWandbRun`` captures the call arguments that ``make_log_fn``
@@ -22,11 +24,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-SCRIPTS_DIR = ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+GRAPH_SCRIPTS_DIR = ROOT / "scripts" / "graph"
+if str(GRAPH_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(GRAPH_SCRIPTS_DIR))
 
-import train as train_cli  # noqa: E402  (script imported as a module)
+import train as train_cli  # noqa: E402  (scripts/graph/train.py imported as a module)
 
 from pcspot.data.dataset import PCBASDataset  # noqa: E402
 from pcspot.data.loader import HalfArray  # noqa: E402
@@ -623,11 +625,11 @@ class PreparseTrainConfigTests(unittest.TestCase):
         out = train_cli._preparse_train_config(
             [
                 "--splits", "s.json",
-                "--train-config", "configs/train/baseline.toml",
+                "--train-config", "configs/train/graph/baseline.toml",
                 "--output-dir", "o",
             ]
         )
-        self.assertEqual(out, Path("configs/train/baseline.toml"))
+        self.assertEqual(out, Path("configs/train/graph/baseline.toml"))
 
 
 if __name__ == "__main__":
