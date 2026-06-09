@@ -1,0 +1,83 @@
+# Main graph-model training config.
+#
+# These hyperparameters come from the W&B Bayesian sweep `l2hn48fy`
+# (dfousekis/pcspot-scripts, 20 trials over the full 96-half TRAIN /
+# 6-half VAL mirror). They reproduce the best trial `charmed-sweep-11`
+# (a6oksll5): best/val/map_joint = 0.358. The whole top cluster
+# (runs 2, 5, 9, 11, 12, 14) agrees within ~0.005 mAP_joint on:
+#   hidden_dim=512, num_mstcn_stages=4, num_mstcn_layers=10,
+#   warmup_steps=100, grad_clip~3, lr~1.1e-4..1.6e-4,
+#   weight_decay~5e-5..8e-5, positive_ratio~0.54..0.57.
+#
+# CRITICAL difference vs the sweep: every 4-epoch trial had
+# best/epoch == 3 (its LAST epoch), i.e. the model was still improving
+# when the sweep budget ran out. So the only deliberate change here is
+# epochs: 4 -> 16. Keep validation + best.pt on and stop early when
+# val/map_joint plateaus.
+#
+#   python scripts/graph/train.py \
+#       --config config.toml \
+#       --train-config configs/train/graph/main.toml \
+#       --splits data/splits.json \
+#       --output-dir checkpoints/graph/main \
+#       --visual-cache <visual_features_root> \
+#       --target-cache .cache/calf \
+#       --keep-best-metric val/map_joint \
+#       --device cuda:0 \
+#       --wandb-run-name graph-main
+
+[train]
+epochs = 16            # sweep used 4 and best epoch was always the last; train longer
+batch_size = 16        # matches the sweep (74595 windows / 4662 steps-per-epoch)
+learning_rate = 1.44e-4
+weight_decay = 5.2e-5
+warmup_steps = 100
+grad_clip = 3.0
+window_size = 128
+stride = 96
+
+# Model dims (sweep winners). visual_dim=384 = DINOv2 ViT-S/14; it MUST
+# match the precomputed --visual-cache. If the sweep ran kinematic-only,
+# set this to 0 — but the "main" model is the DINOv2-fused one.
+hidden_dim = 512
+num_mstcn_stages = 4
+num_mstcn_layers = 10
+visual_dim = 384
+visual_backbone = "dinov2_vits14"
+
+# All four graph extensions on (their defaults; not swept).
+use_zone_nodes = true
+zone_grid = "6x4"
+use_jersey = true
+use_goal_distances = true
+use_radius_edges = true
+radius = 0.15
+
+# Event-centered sampling. Sweep optimum ~0.57 (vs the 0.7 starter).
+sampler = "mixed"
+positive_ratio = 0.57
+event_weighting = "linear"
+sampler_seed = 1
+
+# Single GPU big enough for batch 16 at hidden 512 (the sweep box was).
+# On a smaller card: drop batch_size and raise grad_accum_steps to keep
+# the effective batch at 16.
+grad_accum_steps = 1
+amp = true
+amp_dtype = "bf16"
+
+seed = 42
+
+[validation]
+validation_split = "val"
+decode_threshold = 0.5
+nms_radius = 12
+nms_mode = "per_player_class"
+metric_tolerances = [3, 12, 25]
+
+[wandb]
+enabled = true
+project = "pcspot-scripts"
+tags = ["pcbas", "graph", "main", "from-sweep-l2hn48fy"]
+mode = "online"
+log_artifacts = true

@@ -26,7 +26,7 @@ The model combines:
   counts), oriented to attacking direction via the FOOTPASS
   `left_to_right` column.
 
-Optional integrations bundled with `scripts/train.py`:
+Optional integrations bundled with `scripts/graph/train.py`:
 
 - per-epoch validation that decodes predictions, runs player-centric
   NMS, and reports Average-mAP / joint Average-mAP / player identity
@@ -39,10 +39,6 @@ Optional integrations bundled with `scripts/train.py`:
   Biases”](#experiment-tracking-with-weights--biases) for the full
   setup.
 
-See [`docs/player_centric_hgt_mstcn_calf_design.md`](docs/player_centric_hgt_mstcn_calf_design.md)
-for the full design and [`docs/visual_features.md`](docs/visual_features.md)
-for the visual feature path specifically.
-
 ---
 
 ## Project layout
@@ -51,7 +47,6 @@ for the visual feature path specifically.
 pcspot/        core library (data, models, losses, features, train, inference, eval)
 scripts/       CLIs (mirror, precompute visual features, train, infer, render)
 tests/         unittest suite
-docs/          design documentation
 data/          mirrored PCBAS data (NOT committed)
 third_party/   pnlcalib (camera calibration / visible pitch region helpers)
 ```
@@ -194,17 +189,33 @@ whatever split names you want and pass them to the trainer.
 
 ## 5. Train
 
+The model ships in **three variants** for ablation studies — see
+[§7 “Model variants and ablations”](#model-variants-and-ablations) for
+what each one isolates. Each lives in its own thin CLI package under
+`scripts/<variant>/{train,eval,sweep}.py`; they share the same flags,
+data loading, validation, W&B integration, and checkpoint format via
+`pcspot.train.{cli_common,runner,trainer}`. The full model
+(`graph`) is the default entry point for new experiments:
+
 ```powershell
-.\.venv\Scripts\python.exe scripts\train.py `
+.\.venv\Scripts\python.exe scripts\graph\train.py `
     --config config.toml `
     --splits data/splits.json `
-    --output-dir checkpoints/run1 `
+    --output-dir checkpoints/graph/run1 `
     --epochs 5 --batch-size 4 `
     --window-size 128 --stride 96 `
     --hidden-dim 64 `
     --learning-rate 1e-3 --warmup-steps 50 --grad-clip 1.0 `
     --device cuda:0
 ```
+
+Swap `graph` for `no_zones` or `no_graph` to train the corresponding
+ablation — the CLI, flags, and output format are identical (minus the
+architecture flags each variant doesn't have, noted in the table
+below); only the model that gets constructed changes. A deprecated
+`scripts/train.py` shim still exists and always trains the `graph`
+variant, kept so existing commands that predate the variant split keep
+working.
 
 Useful flags:
 
@@ -223,12 +234,18 @@ Useful flags:
 | `--nms-radius <int>` | `12` | `player_centric_nms` window radius in frames. |
 | `--nms-mode <name>` | `per_player_class` | One of `per_player_class`, `per_player`, `per_class`. |
 | `--metric-tolerances <csv>` | `3,12,25` | Frame tolerances for `average_map_at_tolerances` (~120ms, ~480ms, 1s at 25fps). |
-| `--use-zone-nodes / --no-use-zone-nodes` | on | Enable the heterogeneous `zone` node type in the HGT (count-aware SUM aggregation; see Section 7). |
-| `--zone-grid <GxxGy>` | `6x4` | Pitch grid for zone nodes (also accepts `Gx,Gy`). Only used when `--use-zone-nodes` is on. |
+| `--use-zone-nodes / --no-use-zone-nodes` <sup>`graph` only</sup> | on | Enable the heterogeneous `zone` node type in the HGT (count-aware SUM aggregation; see §7). |
+| `--zone-grid <GxxGy>` <sup>`graph` only</sup> | `6x4` | Pitch grid for zone nodes (also accepts `Gx,Gy`). Only used when `--use-zone-nodes` is on. |
 | `--use-jersey / --no-use-jersey` | on | Enable the jersey-number embedding branch; more identity-stable than `player_id` across tracklet switches. |
 | `--use-goal-distances / --no-use-goal-distances` | on | Add `[dist_own_goal, dist_opp_goal, dist_nearest_sideline]` to the embedder's extra-scalars branch. |
-| `--use-radius-edges / --no-use-radius-edges` | on | Add a variable-degree `radius` edge type + per-player `[n_same_within_r, n_opp_within_r]` degree counts. |
-| `--radius <float>` | `0.15` | Pitch distance (normalized) used by `--use-radius-edges`. `0.15` ≈ 9 m on a 60 m-wide pitch. |
+| `--use-radius-edges / --no-use-radius-edges` <sup>`graph` / `no_zones`</sup> | on | Add a variable-degree `radius` edge type + per-player `[n_same_within_r, n_opp_within_r]` degree counts. Not present on `no_graph` (no graph to add edges to). |
+| `--radius <float>` <sup>`graph` / `no_zones`</sup> | `0.15` | Pitch distance (normalized) used by `--use-radius-edges`. `0.15` ≈ 9 m on a 60 m-wide pitch. |
+
+The flags marked "`graph` only" / "`graph` / `no_zones`" above are
+absent from the other variants' argparsers — they construct a model
+with no matching architecture surface, so passing them to
+`no_zones`/`no_graph` fails at argument-parsing time rather than
+silently no-op-ing.
 
 Per-step and per-epoch logs are printed to stdout. The training run
 metadata (CLI args + CALF config) is dumped to `<output-dir>/run.json`;
@@ -251,17 +268,21 @@ rarely change between commands. They can be moved to a check-in-able
 TOML file and reused via `--train-config`:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\train.py `
+.\.venv\Scripts\python.exe scripts\graph\train.py `
     --config config.toml `
-    --train-config configs\train\baseline.toml `
+    --train-config configs\train\graph\baseline.toml `
     --splits data\splits.json `
-    --output-dir checkpoints\run1 `
+    --output-dir checkpoints\graph\run1 `
     --wandb-run-name run1
 ```
 
-[`configs/train/baseline.toml`](configs/train/baseline.toml) is a
-starter file. Copy it, tweak, and commit per-experiment variants
-alongside the code that produced them.
+Each variant has its own config directory —
+[`configs/train/graph/`](configs/train/graph/),
+[`configs/train/no_zones/`](configs/train/no_zones/),
+[`configs/train/no_graph/`](configs/train/no_graph/) — each containing
+a `baseline.toml` starter file plus a `vast_fullhd_dinov2.toml` for
+full-resolution DINOv2 runs on rented GPU boxes. Copy one, tweak, and
+commit per-experiment variants alongside the code that produced them.
 
 **Precedence is CLI > `--train-config` TOML > built-in defaults.** Any
 flag you still pass on the command line wins, so the TOML is a layer of
@@ -279,10 +300,11 @@ defaults rather than a hard configuration.
 Recognised sections in the train-config TOML are `[train]`,
 `[validation]`, and `[wandb]`. Unknown sections or keys abort the run
 with a clear error so typos never silently change a sweep. See the
-header of [`configs/train/baseline.toml`](configs/train/baseline.toml)
-for the full key list; it mirrors the argparse flags 1:1, plus
-`[train].no_objectness = true|false` (the negated form of
-`--objectness/--no-objectness`).
+header of [`configs/train/graph/baseline.toml`](configs/train/graph/baseline.toml)
+(or the `no_zones` / `no_graph` equivalents — each lists only the
+`[train]` keys its own variant recognises) for the full key list; it
+mirrors the argparse flags 1:1, plus `[train].no_objectness =
+true|false` (the negated form of `--objectness/--no-objectness`).
 
 The resolved `train_config` path is echoed into `<output-dir>/run.json`
 so a run can always be traced back to the file that defined it.
@@ -312,18 +334,18 @@ land in the repo.
    validation, best-checkpoint tracking, and artifact upload:
 
    ```powershell
-   .\.venv\Scripts\python.exe scripts\train.py `
+   .\.venv\Scripts\python.exe scripts\graph\train.py `
        --config config.toml `
        --splits data\splits.json `
-       --output-dir checkpoints\run1 `
+       --output-dir checkpoints\graph\run1 `
        --epochs 5 --batch-size 4 `
        --device cuda:0 `
        --validation-split val `
        --keep-best-metric val/map_joint `
        --wandb `
        --wandb-project pcspot `
-       --wandb-run-name run1 `
-       --wandb-tags pcbas,dinov2 `
+       --wandb-run-name graph-run1 `
+       --wandb-tags pcbas,dinov2,graph `
        --wandb-notes "baseline + DINOv2 ViT-S/14" `
        --wandb-log-artifacts
    ```
@@ -373,10 +395,68 @@ Operational notes:
 
 ### Training from Python
 
-`scripts/train.py` is a thin argparse wrapper around
-[`pcspot.train.trainer.Trainer.fit`](pcspot/train/trainer.py). The
-library API can be used directly from a notebook or another script —
-see Section 7 of the design doc for a worked example.
+`scripts/<variant>/train.py` is a thin argparse wrapper: it defines the
+variant's `architecture` flag group and a `build_model(args)` factory,
+then delegates everything else — data loading, sampler dispatch,
+validation, W&B, checkpointing — to
+[`pcspot.train.runner.run`](pcspot/train/runner.py), which in turn
+drives [`pcspot.train.trainer.Trainer.fit`](pcspot/train/trainer.py).
+To train from a notebook or another script, build a model directly
+(e.g. `PlayerCentricSpottingModel(...)`, `NoZonesSpottingModel(...)`,
+or `NoGraphSpottingModel(...)` from `pcspot.models`) and call
+`Trainer(model, ...).fit(...)`, or call `runner.run(args, build_model)`
+with a hand-built `argparse.Namespace` to reuse the full orchestration.
+
+### Standalone evaluation
+
+`scripts/<variant>/eval.py` reconstructs the matching model class from
+a checkpoint's `run.json` (written by `scripts/<variant>/train.py`)
+and reproduces the validation metrics for a chosen split through the
+exact same decode → NMS → `average_map_at_tolerances` pipeline used
+during training, so standalone numbers match the training-time
+validation log:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\graph\eval.py `
+    --checkpoint checkpoints\graph\run1\best.pt `
+    --config config.toml --splits data\splits.json --split val `
+    --visual-cache .cache\visual --visual-dim 384 --device cuda:0
+```
+
+### Hyperparameter sweeps with Weights & Biases
+
+`scripts/<variant>/sweep.py` is the W&B sweep-agent entry point for
+each variant, with matching sweep definitions in
+[`configs/sweeps/`](configs/sweeps/) (`graph.yaml`, `no_zones.yaml`,
+`no_graph.yaml`). It supports two modes — create-and-run, or
+agent-only against an already-created sweep:
+
+```powershell
+# Create the sweep and start an agent in one go
+.\.venv\Scripts\python.exe scripts\graph\sweep.py `
+    --sweep-config configs\sweeps\graph.yaml `
+    --splits data\splits.json `
+    --output-dir checkpoints\sweeps\graph `
+    --device cuda:0 --epochs 10 --count 20
+
+# ...or attach an agent to a sweep created earlier with `wandb sweep`
+.\.venv\Scripts\python.exe scripts\graph\sweep.py `
+    --sweep-id <entity/project/sweep_id> `
+    --splits data\splits.json `
+    --output-dir checkpoints\sweeps\graph `
+    --device cuda:0 --epochs 10 --count 20
+```
+
+Fixed arguments (paths, device, epoch count, visual cache, validation
+settings) stay constant across all trials; per-trial hyperparameters
+(`learning_rate`, `hidden_dim`, …) are injected by the W&B agent via
+`wandb.config` and applied through the variant's `_build_argparser`
+defaults dict. Each trial writes its checkpoints to
+`<output-dir>/<run_id>/` so concurrent agents never collide. The
+shared agent machinery lives in
+[`pcspot.train.sweep_common`](pcspot/train/sweep_common.py); each
+`scripts/<variant>/sweep.py` only wires it to that variant's
+argparser/`run` pair.
 
 ---
 
@@ -449,9 +529,7 @@ matches the SoccerNet PCBAS Codabench expectations:
 
 Pass `--validate-only` to build the per-match documents and run schema
 validation without writing the zip (useful in CI); `--report
-report.json` writes per-match counts and any validation errors. See
-[`docs/training_guide.md`](docs/training_guide.md) for the full
-end-to-end walkthrough.
+report.json` writes per-match counts and any validation errors.
 
 ---
 
@@ -474,12 +552,38 @@ StackedSample
   -> {time, class, player, score}
 ```
 
-Full discussion of design decisions, including why HGT is implemented
-in pure PyTorch (no `torch_geometric` dependency), why zone nodes are
-**SUM-aggregated** in physical pitch coordinates (and not the
-attacking-canonical frame), how acceleration and match-time features
-are derived, and the team-aware CALF ambiguity policy, lives in
-[`docs/player_centric_hgt_mstcn_calf_design.md`](docs/player_centric_hgt_mstcn_calf_design.md).
+HGT is implemented in pure PyTorch (no `torch_geometric` dependency)
+over dense `(B, T, P, P)` attention masks — `P` is at most ~22 in
+soccer, so dense attention is cheap and the implementation stays
+self-contained. Zone nodes are **SUM-aggregated** (not averaged) in
+physical pitch coordinates rather than the attacking-canonical frame:
+sum is the only aggregation that preserves cardinality, which is what
+makes "is my area congested?" representable at all, and splatting in
+physical coordinates keeps per-team zone counts reflecting actual
+on-pitch congestion regardless of attacking direction.
+
+### Model variants and ablations
+
+The diagram above is the **`graph`** variant — the full model. Two
+sibling variants exist purely to measure the marginal contribution of
+each graph component; train one run of each (everything else equal,
+matching `configs/train/<variant>/baseline.toml`) and compare
+validation metrics:
+
+| Variant | Class | Pipeline | Isolates |
+| --- | --- | --- | --- |
+| `graph` | [`PlayerCentricSpottingModel`](pcspot/models/graph_model.py) | embedder → HGT (player + zone nodes) → MS-TCN++ → head | The full model — baseline for the other two. |
+| `no_zones` | [`NoZonesSpottingModel`](pcspot/models/no_zones_model.py) | embedder → HGT (player nodes only) → MS-TCN++ → head | The marginal value of **zone nodes** alone. The player-player graph (incl. `radius` edges and degree counts) is retained; `use_zone_nodes` is hard-wired off. |
+| `no_graph` | [`NoGraphSpottingModel`](pcspot/models/no_graph_model.py) | embedder → (no HGT) → MS-TCN++ → head | The marginal value of **inter-player message passing** altogether — a pure per-player tower with no edge attention, zone nodes, or team/frame pooling of any kind. |
+
+All three share the embedder, MS-TCN++ stack, action head, output-dict
+contract, loss, and validation pipeline — `no_zones` and `no_graph`
+are subclasses / siblings of `PlayerCentricSpottingModel` that simply
+construct less of the graph, so the `Trainer`, CLI, sweep, and eval
+machinery work identically across all three (see [§5
+“Train”](#5-train)). Note that turning a variant's architecture flags
+off changes the checkpoint shape — each variant is its own checkpoint
+family and cannot load another variant's weights.
 
 ---
 
@@ -501,8 +605,6 @@ are derived, and the team-aware CALF ambiguity policy, lives in
   embedding (`--use-jersey`) partially mitigates this because
   `shirt_number` typically survives an ID swap, but a future iteration
   should also down-weight events whose tracklet is unstable.
-
-The full open-questions list is in Section 9 of the design doc.
 
 ---
 
