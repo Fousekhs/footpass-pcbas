@@ -227,25 +227,37 @@ def load_halves_from_pcbas(
     output_dir: Path,
     *,
     match_id: Optional[str] = None,
+    include_challenge: bool = False,
 ) -> list[HalfArray]:
     """Discover halves on disk via ``scripts/pcbas_data.py``.
 
     Returns one ``HalfArray`` per (match, half). Filters to ``match_id``
     if provided.
+
+    Challenge-split tactical arrays are missing the trailing ``class``
+    column (13 columns instead of the usual 14). Pass
+    ``include_challenge=True`` to include them anyway, with that column
+    zero-padded back in -- safe for inference, where the resulting (empty)
+    events are never used.
     """
     import pcbas_data  # type: ignore  # injected from scripts/
 
     halves: list[HalfArray] = []
-    for match in pcbas_data.list_matches(output_dir):
+    for match in pcbas_data.list_matches(output_dir, include_challenge=include_challenge):
         if match_id is not None and match.match_id != match_id:
             continue
         arrays = pcbas_data.load_tactical_arrays(match)
         for half_key, arr in arrays.items():
+            arr = arr.astype(np.float32, copy=False)
+            if arr.shape[1] == EXPECTED_NCOLS - 1:
+                arr = np.concatenate(
+                    [arr, np.zeros((arr.shape[0], 1), dtype=arr.dtype)], axis=1
+                )
             halves.append(
                 HalfArray(
                     match_id=match.match_id,
                     half_id=half_key,
-                    array=arr.astype(np.float32, copy=False),
+                    array=arr,
                 )
             )
     return halves

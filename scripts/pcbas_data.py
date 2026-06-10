@@ -129,7 +129,9 @@ def _split_key(name: str) -> str:
     return name.rsplit("_", 1)[-1].lower()
 
 
-def find_all_split_dirs(output_dir: Path) -> list[tuple[Path, Optional[Path]]]:
+def find_all_split_dirs(
+    output_dir: Path, *, include_challenge: bool = False
+) -> list[tuple[Path, Optional[Path]]]:
     """Return ``(tactical_dir, video_dir)`` pairs for every usable split.
 
     The ``extracted/`` layout has one folder per split (``tactical_data_TRAIN``,
@@ -139,8 +141,10 @@ def find_all_split_dirs(output_dir: Path) -> list[tuple[Path, Optional[Path]]]:
     ``videos_<res>_TRAIN``. The video dir is optional (it is unused when a
     visual-feature cache is supplied).
 
-    **Challenge splits are excluded**: their tactical arrays drop the ``class``
-    label column and so cannot be used for supervised training or validation.
+    **Challenge splits are excluded by default**: their tactical arrays drop
+    the ``class`` label column and so cannot be used for supervised training
+    or validation. Pass ``include_challenge=True`` to include them anyway
+    (e.g. for offline inference, which doesn't need labels).
     """
     extracted = output_dir / "extracted"
     if not extracted.exists():
@@ -151,7 +155,7 @@ def find_all_split_dirs(output_dir: Path) -> list[tuple[Path, Optional[Path]]]:
         if not child.is_dir():
             continue
         name = child.name.lower()
-        if "challenge" in name:
+        if "challenge" in name and not include_challenge:
             continue
         key = _split_key(child.name)
         if name.startswith("tactical_data_"):
@@ -210,16 +214,16 @@ def _matches_in_dir(tactical_dir: Path, video_dir: Optional[Path]) -> list[Match
     return matches
 
 
-def list_matches(output_dir: Path) -> list[MatchAssets]:
-    """Discover matches across every usable (non-challenge) split.
+def list_matches(output_dir: Path, *, include_challenge: bool = False) -> list[MatchAssets]:
+    """Discover matches across every usable split.
 
     Merges the TRAIN and VALID splits so the caller's split manifest can
-    partition them; the challenge split is skipped (see
-    :func:`find_all_split_dirs`).
+    partition them; the challenge split is skipped unless
+    ``include_challenge=True`` (see :func:`find_all_split_dirs`).
     """
     matches: list[MatchAssets] = []
     seen: set[str] = set()
-    for tactical_dir, video_dir in find_all_split_dirs(output_dir):
+    for tactical_dir, video_dir in find_all_split_dirs(output_dir, include_challenge=include_challenge):
         for match in _matches_in_dir(tactical_dir, video_dir):
             if match.match_id in seen:
                 continue

@@ -17,6 +17,7 @@ from pcspot.data.loader import (
     HalfArray,
     array_to_sample,
     iter_samples_from_half,
+    load_halves_from_pcbas,
 )
 from pcspot.data.windows import Window
 
@@ -110,6 +111,59 @@ class IterSamplesTests(unittest.TestCase):
             for f in s.frames.tolist():
                 seen.add(f)
         self.assertEqual(seen, set(range(7)))
+
+
+class LoadHalvesFromPcbasTests(unittest.TestCase):
+    def test_default_excludes_challenge(self) -> None:
+        import types
+        from unittest import mock
+
+        captured: dict[str, object] = {}
+
+        def fake_list_matches(output_dir, *, include_challenge=False):
+            captured["include_challenge"] = include_challenge
+            return []
+
+        fake_module = types.SimpleNamespace(
+            list_matches=fake_list_matches,
+            load_tactical_arrays=lambda m: {},
+        )
+
+        with mock.patch.dict(sys.modules, {"pcbas_data": fake_module}):
+            halves = load_halves_from_pcbas(Path("unused"))
+
+        self.assertFalse(captured["include_challenge"])
+        self.assertEqual(halves, [])
+
+    def test_include_challenge_pads_missing_class_column(self) -> None:
+        import types
+        from unittest import mock
+
+        match = types.SimpleNamespace(match_id="game_0")
+        captured: dict[str, object] = {}
+
+        def fake_list_matches(output_dir, *, include_challenge=False):
+            captured["include_challenge"] = include_challenge
+            return [match]
+
+        def fake_load_tactical_arrays(m):
+            return {"game_0_H1": np.zeros((3, EXPECTED_NCOLS - 1), dtype=np.float32)}
+
+        fake_module = types.SimpleNamespace(
+            list_matches=fake_list_matches,
+            load_tactical_arrays=fake_load_tactical_arrays,
+        )
+
+        with mock.patch.dict(sys.modules, {"pcbas_data": fake_module}):
+            halves = load_halves_from_pcbas(
+                Path("unused"), match_id="game_0", include_challenge=True
+            )
+
+        self.assertTrue(captured["include_challenge"])
+        self.assertEqual(len(halves), 1)
+        half = halves[0]
+        self.assertEqual(half.array.shape, (3, EXPECTED_NCOLS))
+        np.testing.assert_array_equal(half.array[:, EXPECTED_NCOLS - 1], 0.0)
 
 
 if __name__ == "__main__":
