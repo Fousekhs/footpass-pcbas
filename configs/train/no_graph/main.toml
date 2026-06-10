@@ -1,0 +1,92 @@
+# Main no-graph ablation config.
+#
+# Controlled ablation, NOT a re-tuned model: every [train] key below is
+# copied verbatim from configs/train/graph/main.toml (the run mqvs9uqo,
+# itself the product of W&B sweep l2hn48fy) so this run differs from
+# graph-main ONLY in architecture. The no_graph variant
+# (NoGraphSpottingModel) removes the HGTEncoder entirely -- pure
+# per-player tower: embedder -> MS-TCN++ -> head.
+#
+# Keys NOT carried over because this variant doesn't accept them at all
+# (see pcspot/train/cli_common.py:_KNOWN_TRAIN_KEYS and
+# scripts/no_graph/train.py:_EXTRA_TRAIN_KEYS = frozenset()):
+#   use_zone_nodes, zone_grid, use_radius_edges, radius
+# use_jersey / use_goal_distances are kept -- per-player feature toggles,
+# not graph-derived.
+#
+# See docs/zone_nodes.md "Model variants" table:
+#   graph (mqvs9uqo)  -> PlayerCentricSpottingModel, full HGT + zone nodes
+#   no_zones          -> NoZonesSpottingModel, player-only HGT
+#   no_graph (this)   -> NoGraphSpottingModel, no HGT at all
+#
+# Capacity (hidden_dim=512, visual_dim=384) is held constant on purpose --
+# the ablation isolates "graph vs. no graph", not "graph vs. smaller
+# model". no_graph has strictly less compute per step than graph (no HGT
+# attention over player+zone nodes), so VRAM at batch_size=16/hidden_dim=512
+# should have MORE headroom than graph-main's ~25.6/32 GB. Same dataloader
+# settings apply (the run was likely input-bound on cache reads).
+#
+#   python scripts/no_graph/train.py \
+#       --config config.toml \
+#       --train-config configs/train/no_graph/main.toml \
+#       --splits data/splits.json \
+#       --output-dir checkpoints/no_graph/main \
+#       --visual-cache <visual_features_root> \
+#       --target-cache .cache/calf \
+#       --keep-best-metric val/map_joint \
+#       --device cuda:0 \
+#       --wandb-run-name no_graph-main
+
+[train]
+epochs = 24
+batch_size = 16
+learning_rate = 1.44e-4
+weight_decay = 5.2e-5
+warmup_steps = 100
+grad_clip = 3.0
+window_size = 128
+stride = 96
+
+# Same dims as graph/main.toml -- capacity held constant for the ablation.
+hidden_dim = 512
+num_mstcn_stages = 4
+num_mstcn_layers = 10
+visual_dim = 384
+visual_backbone = "dinov2_vits14"
+
+# Per-player feature toggles (not graph-derived); no zone/radius/edge
+# knobs here -- this variant has no graph encoder at all.
+use_jersey = true
+use_goal_distances = true
+
+# Same event-centered sampling as graph/main.toml.
+sampler = "mixed"
+positive_ratio = 0.57
+event_weighting = "linear"
+sampler_seed = 1
+
+# Single GPU; same as graph/main.toml.
+grad_accum_steps = 1
+amp = true
+amp_dtype = "bf16"
+
+# Same dataloader settings as graph/main.toml.
+num_workers = 16
+prefetch_factor = 4
+persistent_workers = true
+
+seed = 42
+
+[validation]
+validation_split = "val"
+decode_threshold = 0.5
+nms_radius = 12
+nms_mode = "per_player_class"
+metric_tolerances = [3, 12, 25]
+
+[wandb]
+enabled = true
+project = "pcspot-scripts"
+tags = ["pcbas", "no_graph", "main", "ablation", "matches-graph-main"]
+mode = "online"
+log_artifacts = true

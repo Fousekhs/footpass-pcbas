@@ -10,10 +10,19 @@
 #   weight_decay~5e-5..8e-5, positive_ratio~0.54..0.57.
 #
 # CRITICAL difference vs the sweep: every 4-epoch trial had
-# best/epoch == 3 (its LAST epoch), i.e. the model was still improving
-# when the sweep budget ran out. So the only deliberate change here is
-# epochs: 4 -> 16. Keep validation + best.pt on and stop early when
-# val/map_joint plateaus.
+# best/epoch == 3 (its LAST epoch) and val/map_joint was still climbing
+# ~linearly (2-epoch partials ~0.21 -> 4-epoch ~0.35). epochs=24 (6x the
+# sweep) lets the warmup->cosine schedule FULLY anneal at a horizon that
+# should plateau, rather than killing a longer run mid-decay and losing
+# the low-LR fine-tuning tail. best.pt tracks val/map_joint every epoch;
+# if val is still clearly rising in the last 2-3 epochs, do a follow-up
+# run instead of guessing higher now.
+#
+# Hardware: the sweep ran on the SAME GPU (RTX 5090, 32 GB). At
+# batch_size=16 / hidden_dim=512 peak VRAM was ~25.6 GB (~6 GB headroom).
+# ~1.79 steps/s -> ~43 min/epoch with 8 workers; it was likely
+# input-bound (cache reads + CALF target gen), so num_workers=16 (below)
+# + --target-cache are the levers to cut wall-clock.
 #
 #   python scripts/graph/train.py \
 #       --config config.toml \
@@ -27,8 +36,8 @@
 #       --wandb-run-name graph-main
 
 [train]
-epochs = 16            # sweep used 4 and best epoch was always the last; train longer
-batch_size = 16        # matches the sweep (74595 windows / 4662 steps-per-epoch)
+epochs = 24            # 6x the sweep's 4 (best epoch was always the last); fully anneals cosine here
+batch_size = 16        # sweep value (LR tuned at batch 16); peaked ~25.6/32 GB, leave it
 learning_rate = 1.44e-4
 weight_decay = 5.2e-5
 warmup_steps = 100
@@ -65,6 +74,14 @@ sampler_seed = 1
 grad_accum_steps = 1
 amp = true
 amp_dtype = "bf16"
+
+# Dataloader. Default num_workers=0 is the slow in-process path; the
+# sweep used 8 on an 80-core box. You have 40 vCPU / 96 GB, and the run
+# was likely input-bound, so 16 workers feed the 5090 better. Drop to 12
+# if RAM gets tight. persistent_workers avoids re-spawn each epoch.
+num_workers = 16
+prefetch_factor = 4
+persistent_workers = true
 
 seed = 42
 
