@@ -70,6 +70,17 @@ def _load_output_dir(config_path: Path) -> Path:
     return out
 
 
+def _half_matches(half_id: str, target: str) -> bool:
+    """Compare ``--half H1``/``H2`` against ``HalfArray.half_id``.
+
+    ``half_id`` is the raw HDF5 key (``"<match_id>_H<n>"``), not a bare
+    ``"H1"``/``"H2"`` token, so an exact-equality check never matches.
+    """
+    half_id = str(half_id)
+    target = str(target)
+    return half_id == target or half_id.endswith(f"_{target}")
+
+
 # Per-variant (model class, run.json "args" keys to mine for __init__
 # kwargs). Mirrors scripts/{graph,no_zones,no_graph}/eval.py's
 # MODEL_INIT_KEYS — kept here too so this general-purpose offline/online
@@ -226,7 +237,7 @@ def _run_offline(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
     if args.half is not None and args.half != "both":
-        all_halves = [h for h in all_halves if str(h.half_id) == str(args.half)]
+        all_halves = [h for h in all_halves if _half_matches(h.half_id, args.half)]
         if not all_halves:
             print(f"No half {args.half!r} for match {args.match_id!r}", file=sys.stderr)
             return 1
@@ -321,7 +332,7 @@ def _run_online(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
     if args.half is not None:
-        all_halves = [h for h in all_halves if str(h.half_id) == str(args.half)]
+        all_halves = [h for h in all_halves if _half_matches(h.half_id, args.half)]
     if not all_halves:
         print("No matching halves after filtering.", file=sys.stderr)
         return 1
