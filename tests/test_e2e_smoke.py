@@ -43,6 +43,7 @@ from pcspot.eval.nms import decode_predictions, player_centric_nms
 from pcspot.eval.submission import (
     InternalPrediction,
     SUBMISSION_FILE_NAME,
+    build_match_document,
     group_predictions_by_match,
     validate_submission_payload,
     write_submission_zip,
@@ -187,17 +188,16 @@ class EndToEndSmokeTests(unittest.TestCase):
                     match_id=half.match_id,
                     half=1,
                     frame=8,
+                    team=0,
+                    jersey_number=1,
                     class_id=2,
-                    player_id=101,
                     score=0.42,
-                    fps=25.0,
                 )
             ]
             by_match = group_predictions_by_match(internal)
-            from pcspot.eval.submission import build_match_document
             self.assertEqual(
                 validate_submission_payload(
-                    build_match_document(half.match_id, by_match[half.match_id])
+                    {half.match_id: build_match_document(by_match[half.match_id])}
                 ),
                 [],
             )
@@ -205,12 +205,9 @@ class EndToEndSmokeTests(unittest.TestCase):
             write_submission_zip(by_match, zip_path)
             self.assertTrue(zip_path.exists())
             with zipfile.ZipFile(zip_path, "r") as zf:
-                self.assertIn(
-                    f"{half.match_id}/{SUBMISSION_FILE_NAME}", zf.namelist()
-                )
-                payload = json.loads(zf.read(f"{half.match_id}/{SUBMISSION_FILE_NAME}"))
-            self.assertEqual(payload["UrlLocal"], half.match_id)
-            self.assertEqual(len(payload["predictions"]), 1)
+                self.assertIn(SUBMISSION_FILE_NAME, zf.namelist())
+                payload = json.loads(zf.read(SUBMISSION_FILE_NAME))
+            self.assertEqual(len(payload[half.match_id]), 1)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,13 @@
 """Package per-match prediction JSON files into a Codabench submission zip.
 
 Reads the prediction-file layout produced by ``scripts/infer.py``
-(one JSON file per match-half with absolute-frame entries) and writes
-a ``submission.zip`` whose layout matches the SoccerNet / PCBAS
-Codabench expectations::
+(one JSON file per match-half, each entry already in the final
+``{frame, team, jersey_number, action_class, score}`` shape) and writes
+a ``submission.zip`` containing a single ``predictions.json`` mapping
+each match id to its flat list of predictions::
 
     submission.zip
-    ├── game_01/Labels-ball.json
-    ├── game_02/Labels-ball.json
-    └── ...
+    └── predictions.json   # {"game_01": [...], "game_02": [...], ...}
 
 Typical usage::
 
@@ -23,7 +22,6 @@ Typical usage::
     # 2. Bundle every match into the Codabench-shaped zip.
     python scripts/write_codabench_submission.py \\
         --predictions predictions/ \\
-        --fps 25 \\
         --out submission.zip
 
 Pass ``--explicit-match <id> --explicit-half <n>`` when the filename
@@ -46,9 +44,10 @@ if str(ROOT) not in sys.path:
 
 from pcspot.eval.submission import (  # noqa: E402
     InternalPrediction,
+    build_match_document,
     group_predictions_by_match,
     load_internal_predictions,
-    validate_submission_payload,
+    validate_match_predictions,
     write_submission_zip,
 )
 
@@ -70,12 +69,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("submission.zip"),
         help="Output zip path. Default: submission.zip.",
-    )
-    p.add_argument(
-        "--fps",
-        type=float,
-        default=25.0,
-        help="Frame rate used to translate frame indices into seconds.",
     )
     p.add_argument(
         "--explicit-match",
@@ -133,7 +126,6 @@ def main(argv: list[str] | None = None) -> int:
                 path,
                 match_id=args.explicit_match if path.is_file() and args.predictions.is_file() else None,
                 half=args.explicit_half if path.is_file() and args.predictions.is_file() else None,
-                fps=float(args.fps),
             )
         except Exception as exc:
             print(f"warning: skipping {path}: {exc!r}", file=sys.stderr)
@@ -148,16 +140,14 @@ def main(argv: list[str] | None = None) -> int:
     by_match = group_predictions_by_match(preds)
     print(f"Matches: {len(by_match)}; total predictions: {len(preds)}")
 
-    # Validate all documents before deciding to write anything; mirror
-    # this in --report so CI can fail before any artifact is touched.
-    docs: dict[str, dict] = {}
+    # Validate every match's predictions before deciding to write
+    # anything; mirror this in --report so CI can fail before any
+    # artifact is touched.
     report: dict[str, dict] = {}
     any_errors = False
     for match_id, preds_for_match in by_match.items():
-        from pcspot.eval.submission import build_match_document
-        doc = build_match_document(match_id, preds_for_match)
-        errors = validate_submission_payload(doc)
-        docs[match_id] = doc
+        doc = build_match_document(preds_for_match)
+        errors = validate_match_predictions(doc)
         report[match_id] = {
             "predictions": len(preds_for_match),
             "errors": list(errors),

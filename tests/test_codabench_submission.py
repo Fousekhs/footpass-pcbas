@@ -19,132 +19,149 @@ if str(SCRIPTS_DIR) not in sys.path:
 from pcspot.eval.submission import (  # noqa: E402
     InternalPrediction,
     SUBMISSION_FILE_NAME,
-    _format_game_time,
-    _format_position,
     build_match_document,
     group_predictions_by_match,
     load_internal_predictions,
     prediction_to_payload,
+    validate_match_predictions,
     validate_submission_payload,
     write_submission_zip,
 )
 
 
 def _pred(match: str = "game_01", half: int = 1, frame: int = 25,
-          class_id: int = 2, player_id: int = 101, score: float = 0.9,
-          fps: float = 25.0) -> InternalPrediction:
+          team: int = 0, jersey_number: int = 10, class_id: int = 2,
+          score: float = 0.9) -> InternalPrediction:
     return InternalPrediction(
         match_id=match,
         half=half,
         frame=frame,
+        team=team,
+        jersey_number=jersey_number,
         class_id=class_id,
-        player_id=player_id,
         score=score,
-        fps=fps,
     )
 
 
 class FormattingTests(unittest.TestCase):
-    def test_game_time_rounds_to_seconds(self) -> None:
-        self.assertEqual(_format_game_time(1, 0.0), "1 - 00:00")
-        self.assertEqual(_format_game_time(1, 62.4), "1 - 01:02")
-        self.assertEqual(_format_game_time(2, 1530.7), "2 - 25:31")
-
-    def test_position_is_milliseconds(self) -> None:
-        self.assertEqual(_format_position(0.0), "0")
-        self.assertEqual(_format_position(1.234), "1234")
-
     def test_prediction_to_payload_has_required_fields(self) -> None:
-        payload = prediction_to_payload(_pred(frame=25, class_id=2, score=0.5))
-        self.assertEqual(payload["label"], "Pass")
-        self.assertEqual(payload["half"], 1)
-        self.assertEqual(payload["gameTime"], "1 - 00:01")
-        # 25 frames @ 25 fps = 1.0 s -> 1000 ms.
-        self.assertEqual(payload["position"], "1000")
-        self.assertEqual(payload["player_id"], 101)
+        payload = prediction_to_payload(
+            _pred(frame=1425, team=0, jersey_number=10, class_id=2, score=0.87)
+        )
+        self.assertEqual(
+            payload,
+            {
+                "frame": 1425,
+                "team": 0,
+                "jersey_number": 10,
+                "action_class": "Pass",
+                "score": 0.87,
+            },
+        )
 
 
 class GroupingTests(unittest.TestCase):
     def test_predictions_sorted_within_match(self) -> None:
         preds = [
-            _pred(match="game_01", half=2, frame=50, class_id=4, player_id=200),
-            _pred(match="game_01", half=1, frame=100, class_id=2, player_id=101),
-            _pred(match="game_01", half=1, frame=50, class_id=3, player_id=101),
+            _pred(match="game_01", half=2, frame=50, team=1, jersey_number=4),
+            _pred(match="game_01", half=1, frame=100, team=0, jersey_number=10),
+            _pred(match="game_01", half=1, frame=50, team=0, jersey_number=7),
         ]
         by_match = group_predictions_by_match(preds)
         self.assertEqual(list(by_match.keys()), ["game_01"])
-        sequence = [(p.half, p.frame, p.class_id) for p in by_match["game_01"]]
-        # Sorted: (half, frame, class_id, player_id).
+        sequence = [(p.half, p.frame, p.team, p.jersey_number) for p in by_match["game_01"]]
+        # Sorted: (half, frame, team, jersey_number).
         self.assertEqual(
-            sequence, [(1, 50, 3), (1, 100, 2), (2, 50, 4)]
+            sequence, [(1, 50, 0, 7), (1, 100, 0, 10), (2, 50, 1, 4)]
         )
 
 
 class ValidationTests(unittest.TestCase):
-    def _valid_doc(self) -> dict:
-        return build_match_document("game_01", [_pred()])
+    def _valid_doc(self) -> list[dict]:
+        return build_match_document([_pred()])
 
     def test_valid_doc_has_no_errors(self) -> None:
-        self.assertEqual(validate_submission_payload(self._valid_doc()), [])
+        self.assertEqual(validate_match_predictions(self._valid_doc()), [])
+        self.assertEqual(
+            validate_submission_payload({"game_01": self._valid_doc()}), []
+        )
 
-    def test_missing_top_level_field_flagged(self) -> None:
-        doc = self._valid_doc()
-        del doc["UrlLocal"]
-        self.assertIn("missing top-level field 'UrlLocal'", validate_submission_payload(doc))
+    def test_predictions_must_be_a_list(self) -> None:
+        errs = validate_match_predictions({"not": "a list"})
+        self.assertTrue(any("must be a list" in e for e in errs))
 
-    def test_bad_game_time_flagged(self) -> None:
+    def test_missing_field_flagged(self) -> None:
         doc = self._valid_doc()
-        doc["predictions"][0]["gameTime"] = "3 - 99:99"
-        errs = validate_submission_payload(doc)
-        self.assertTrue(any("gameTime" in e for e in errs))
+        del doc[0]["frame"]
+        errs = validate_match_predictions(doc)
+        self.assertTrue(any("missing field 'frame'" in e for e in errs))
 
-    def test_unknown_label_flagged(self) -> None:
+    def test_unknown_action_class_flagged(self) -> None:
         doc = self._valid_doc()
-        doc["predictions"][0]["label"] = "Bicycle Kick"
-        errs = validate_submission_payload(doc)
-        self.assertTrue(any("label" in e for e in errs))
+        doc[0]["action_class"] = "Bicycle Kick"
+        errs = validate_match_predictions(doc)
+        self.assertTrue(any("action_class" in e for e in errs))
 
-    def test_confidence_out_of_range_flagged(self) -> None:
+    def test_background_action_class_flagged(self) -> None:
         doc = self._valid_doc()
-        doc["predictions"][0]["confidence"] = "1.5"
-        errs = validate_submission_payload(doc)
-        self.assertTrue(any("confidence" in e for e in errs))
+        doc[0]["action_class"] = "background"
+        errs = validate_match_predictions(doc)
+        self.assertTrue(any("action_class" in e for e in errs))
 
-    def test_half_must_be_one_or_two(self) -> None:
+    def test_score_out_of_range_flagged(self) -> None:
         doc = self._valid_doc()
-        doc["predictions"][0]["half"] = 3
-        errs = validate_submission_payload(doc)
-        self.assertTrue(any("half" in e for e in errs))
+        doc[0]["score"] = 1.5
+        errs = validate_match_predictions(doc)
+        self.assertTrue(any("score" in e for e in errs))
+
+    def test_team_must_be_zero_or_one(self) -> None:
+        doc = self._valid_doc()
+        doc[0]["team"] = 2
+        errs = validate_match_predictions(doc)
+        self.assertTrue(any("team" in e for e in errs))
+
+    def test_jersey_number_must_be_integer(self) -> None:
+        doc = self._valid_doc()
+        doc[0]["jersey_number"] = "ten"
+        errs = validate_match_predictions(doc)
+        self.assertTrue(any("jersey_number" in e for e in errs))
+
+    def test_submission_payload_must_be_a_mapping(self) -> None:
+        errs = validate_submission_payload(["not", "a", "dict"])
+        self.assertTrue(any("must be a dict" in e for e in errs))
+
+    def test_submission_payload_prefixes_errors_with_match_id(self) -> None:
+        doc = self._valid_doc()
+        doc[0]["team"] = 2
+        errs = validate_submission_payload({"game_01": doc})
+        self.assertTrue(any(e.startswith("game_01: ") for e in errs))
 
 
 class ZipWriterTests(unittest.TestCase):
-    def test_zip_contains_per_match_documents(self) -> None:
+    def test_zip_contains_predictions_json(self) -> None:
         preds = [
-            _pred(match="game_01", half=1, frame=10),
-            _pred(match="game_02", half=2, frame=50, class_id=3, player_id=205),
+            _pred(match="game_01", half=1, frame=10, team=0, jersey_number=10),
+            _pred(match="game_02", half=2, frame=50, team=1, jersey_number=4, class_id=7),
         ]
         by_match = group_predictions_by_match(preds)
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "submission.zip"
-            docs = write_submission_zip(by_match, out)
+            payload = write_submission_zip(by_match, out)
             self.assertTrue(out.exists())
-            self.assertEqual(sorted(docs.keys()), ["game_01", "game_02"])
+            self.assertEqual(sorted(payload.keys()), ["game_01", "game_02"])
             with zipfile.ZipFile(out, "r") as zf:
-                names = sorted(zf.namelist())
-                self.assertEqual(
-                    names,
-                    [f"game_01/{SUBMISSION_FILE_NAME}", f"game_02/{SUBMISSION_FILE_NAME}"],
-                )
-                payload = json.loads(zf.read(f"game_01/{SUBMISSION_FILE_NAME}"))
-                self.assertEqual(payload["UrlLocal"], "game_01")
-                self.assertEqual(payload["predictions"][0]["player_id"], 101)
+                self.assertEqual(zf.namelist(), [SUBMISSION_FILE_NAME])
+                doc = json.loads(zf.read(SUBMISSION_FILE_NAME))
+            self.assertEqual(sorted(doc.keys()), ["game_01", "game_02"])
+            self.assertEqual(doc["game_01"][0]["jersey_number"], 10)
+            self.assertEqual(doc["game_02"][0]["action_class"], "Tackle")
 
-    def test_writer_refuses_invalid_document(self) -> None:
-        # Build a manifestly invalid prediction (out-of-range half) and
+    def test_writer_refuses_invalid_payload(self) -> None:
+        # Build a manifestly invalid prediction (out-of-range team) and
         # ensure the writer rejects before producing a zip.
         bad = InternalPrediction(
-            match_id="game_01", half=9, frame=10, class_id=2,
-            player_id=101, score=0.5,
+            match_id="game_01", half=1, frame=10, team=9,
+            jersey_number=10, class_id=2, score=0.5,
         )
         with TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
@@ -165,29 +182,30 @@ class LoadInternalPredictionsTests(unittest.TestCase):
                 Path(tmp),
                 "game_18__H2.json",
                 [
-                    {"frame": 12, "class_id": 2, "player_id": 101, "score": 0.7,
-                     "time_seconds": 0.48, "class_name": "Pass"},
+                    {"frame": 12, "team": 0, "jersey_number": 10,
+                     "action_class": "Pass", "score": 0.7},
                 ],
             )
-            preds = load_internal_predictions(path, fps=25.0)
+            preds = load_internal_predictions(path)
             self.assertEqual(len(preds), 1)
             self.assertEqual(preds[0].match_id, "game_18")
             self.assertEqual(preds[0].half, 2)
-            self.assertEqual(preds[0].fps, 25.0)
+            self.assertEqual(preds[0].team, 0)
+            self.assertEqual(preds[0].jersey_number, 10)
+            self.assertEqual(preds[0].class_id, 2)
 
     def test_explicit_overrides_filename(self) -> None:
         with TemporaryDirectory() as tmp:
             path = self._write_infer_file(
                 Path(tmp),
                 "weird_name.json",
-                [{"frame": 0, "class_id": 1, "player_id": 100, "score": 0.5}],
+                [{"frame": 0, "team": 1, "jersey_number": 4,
+                  "action_class": "Tackle", "score": 0.5}],
             )
-            preds = load_internal_predictions(
-                path, match_id="game_99", half=1, fps=30.0
-            )
+            preds = load_internal_predictions(path, match_id="game_99", half=1)
             self.assertEqual(preds[0].match_id, "game_99")
             self.assertEqual(preds[0].half, 1)
-            self.assertEqual(preds[0].fps, 30.0)
+            self.assertEqual(preds[0].class_id, 7)
 
 
 class WriteCodabenchSubmissionCliTests(unittest.TestCase):
@@ -199,9 +217,11 @@ class WriteCodabenchSubmissionCliTests(unittest.TestCase):
             preds_dir.mkdir()
             for name, entries in [
                 ("game_01__H1.json",
-                 [{"frame": 10, "class_id": 2, "player_id": 101, "score": 0.9}]),
+                 [{"frame": 10, "team": 0, "jersey_number": 10,
+                   "action_class": "Pass", "score": 0.9}]),
                 ("game_01__H2.json",
-                 [{"frame": 25, "class_id": 3, "player_id": 202, "score": 0.6}]),
+                 [{"frame": 25, "team": 1, "jersey_number": 4,
+                   "action_class": "Cross", "score": 0.6}]),
             ]:
                 (preds_dir / name).write_text(json.dumps(entries), encoding="utf-8")
             out = Path(tmp) / "submission.zip"
@@ -211,18 +231,17 @@ class WriteCodabenchSubmissionCliTests(unittest.TestCase):
                     "--predictions", str(preds_dir),
                     "--out", str(out),
                     "--report", str(report),
-                    "--fps", "25",
                 ]
             )
             self.assertEqual(rc, 0)
             self.assertTrue(out.exists())
             self.assertTrue(report.exists())
             with zipfile.ZipFile(out, "r") as zf:
-                payload = json.loads(zf.read(f"game_01/{SUBMISSION_FILE_NAME}"))
-            # Both halves should end up in the same Labels-ball.json
-            # ordered by (half, frame, class_id, player_id).
-            halves = [p["half"] for p in payload["predictions"]]
-            self.assertEqual(halves, [1, 2])
+                doc = json.loads(zf.read(SUBMISSION_FILE_NAME))
+            # Both halves should end up in the same match's prediction
+            # list, ordered by (half, frame, team, jersey_number).
+            action_classes = [p["action_class"] for p in doc["game_01"]]
+            self.assertEqual(action_classes, ["Pass", "Cross"])
 
     def test_validate_only_does_not_write_zip(self) -> None:
         import write_codabench_submission as wcs
@@ -232,7 +251,8 @@ class WriteCodabenchSubmissionCliTests(unittest.TestCase):
             preds_dir.mkdir()
             (preds_dir / "game_01__H1.json").write_text(
                 json.dumps(
-                    [{"frame": 10, "class_id": 2, "player_id": 101, "score": 0.5}]
+                    [{"frame": 10, "team": 0, "jersey_number": 10,
+                      "action_class": "Pass", "score": 0.5}]
                 ),
                 encoding="utf-8",
             )
@@ -241,7 +261,6 @@ class WriteCodabenchSubmissionCliTests(unittest.TestCase):
                 [
                     "--predictions", str(preds_dir),
                     "--out", str(out),
-                    "--fps", "25",
                     "--validate-only",
                 ]
             )

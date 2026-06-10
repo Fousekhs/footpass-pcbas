@@ -496,17 +496,16 @@ for the buffer-eviction details.
 
 ### Output schema
 
-Predictions are written as a JSON array, sorted by `(frame, class_id,
-player_id)`:
+Predictions are written as a JSON array, sorted by `(frame, team,
+jersey_number)`:
 
 ```json
 [
   {
     "frame": 12345,
-    "time_seconds": 493.8,
-    "class_id": 2,
-    "class_name": "Pass",
-    "player_id": 110,
+    "team": 0,
+    "jersey_number": 10,
+    "action_class": "Pass",
     "score": 0.91
   }
 ]
@@ -517,13 +516,13 @@ player_id)`:
 Submission packaging is bundled. The writer
 [`scripts/write_codabench_submission.py`](scripts/write_codabench_submission.py)
 takes a directory of per-half prediction JSON files (the format emitted
-by `scripts/infer.py`) and produces a `submission.zip` whose layout
-matches the SoccerNet PCBAS Codabench expectations:
+by `scripts/infer.py`) and produces a `submission.zip` containing a
+single `predictions.json` mapping each match id to its flat list of
+predictions:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\write_codabench_submission.py `
     --predictions predictions\ `
-    --fps 25 `
     --out submission.zip
 ```
 

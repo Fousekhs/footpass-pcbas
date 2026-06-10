@@ -50,7 +50,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from pcspot.data.dataset import PCBASDataset
-from pcspot.data.loader import COL_FRAME, load_halves_from_pcbas
+from pcspot.data.loader import (
+    COL_FRAME,
+    COL_PLAYER_ID,
+    COL_SHIRT,
+    HalfArray,
+    _team_of_player,
+    load_halves_from_pcbas,
+)
 from pcspot.data.schema import PCBAS_CLASS_NAMES
 from pcspot.data.splits import SplitManifest
 from pcspot.eval.nms import Prediction, decode_predictions, player_centric_nms
@@ -214,21 +221,38 @@ def _make_model(
     return model
 
 
-def _prediction_to_dict(p: Prediction, fps: float) -> dict:
+def _build_jersey_lookup(halves: Iterable[HalfArray]) -> dict[int, int]:
+    """Map ``player_id -> shirt number`` from tactical-array rows.
+
+    Shirt numbers are constant for a player across a match, so a single
+    lookup built from all available halves covers every prediction.
+    """
+    lookup: dict[int, int] = {}
+    for half in halves:
+        arr = half.array
+        if arr.size == 0:
+            continue
+        for pid, shirt in zip(arr[:, COL_PLAYER_ID], arr[:, COL_SHIRT]):
+            if not np.isfinite(pid) or not np.isfinite(shirt):
+                continue
+            lookup.setdefault(int(pid), int(shirt))
+    return lookup
+
+
+def _prediction_to_dict(p: Prediction, jersey_lookup: dict[int, int]) -> dict:
     return {
         "frame": int(p.time),
-        "time_seconds": round(float(p.time) / float(fps), 4),
-        "class_id": int(p.class_id),
-        "class_name": PCBAS_CLASS_NAMES.get(int(p.class_id), str(p.class_id)),
-        "player_id": int(p.player_id),
+        "team": _team_of_player(float(p.player_id)),
+        "jersey_number": int(jersey_lookup.get(int(p.player_id), -1)),
+        "action_class": PCBAS_CLASS_NAMES.get(int(p.class_id), str(p.class_id)),
         "score": float(p.score),
     }
 
 
-def _write_predictions(out_path: Path, preds: Iterable[Prediction], fps: float) -> int:
+def _write_predictions(out_path: Path, preds: Iterable[Prediction], jersey_lookup: dict[int, int]) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [_prediction_to_dict(p, fps) for p in preds]
-    payload.sort(key=lambda x: (x["frame"], x["class_id"], x["player_id"]))
+    payload = [_prediction_to_dict(p, jersey_lookup) for p in preds]
+    payload.sort(key=lambda x: (x["frame"], x["team"], x["jersey_number"]))
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return len(payload)
 
@@ -246,6 +270,8 @@ def _run_offline(args: argparse.Namespace) -> int:
         if not all_halves:
             print(f"No half {args.half!r} for match {args.match_id!r}", file=sys.stderr)
             return 1
+
+    jersey_lookup = _build_jersey_lookup(all_halves)
 
     manifest = SplitManifest.single(
         "infer",
@@ -317,7 +343,7 @@ def _run_offline(args: argparse.Namespace) -> int:
     nms_preds = player_centric_nms(
         all_preds, window_radius=args.nms_radius, mode=args.nms_mode
     )
-    n = _write_predictions(args.out, nms_preds, fps=args.fps)
+    n = _write_predictions(args.out, nms_preds, jersey_lookup)
     print(f"Wrote {n} predictions to {args.out}")
     return 0
 
@@ -342,6 +368,7 @@ def _run_online(args: argparse.Namespace) -> int:
         print("No matching halves after filtering.", file=sys.stderr)
         return 1
     half = all_halves[0]
+    jersey_lookup = _build_jersey_lookup([half])
 
     from pcspot.features.cropper import CropperConfig, PaddedPlayerCropper
     from pcspot.features.dinov2 import DinoV2Config, DinoV2Extractor
@@ -404,7 +431,7 @@ def _run_online(args: argparse.Namespace) -> int:
     finally:
         cap.release()
 
-    n = _write_predictions(args.out, all_preds, fps=args.fps)
+    n = _write_predictions(args.out, all_preds, jersey_lookup)
     print(f"Wrote {n} predictions ({frame_index} frames processed) to {args.out}")
     return 0
 
