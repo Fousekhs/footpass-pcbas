@@ -220,7 +220,7 @@ def _write_predictions(out_path: Path, preds: Iterable[Prediction], fps: float) 
 # --------------------------------------------------------------------- offline
 def _run_offline(args: argparse.Namespace) -> int:
     data_dir = _load_output_dir(args.config.resolve())
-    all_halves = load_halves_from_pcbas(data_dir, match_id=args.match_id)
+    all_halves = load_halves_from_pcbas(data_dir, match_id=args.match_id, include_challenge=True)
     if not all_halves:
         print(f"No halves found for match-id={args.match_id} under {data_dir}",
               file=sys.stderr)
