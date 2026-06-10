@@ -58,6 +58,7 @@ from pcspot.models.graph_model import PlayerCentricSpottingModel
 from pcspot.models.no_graph_model import NoGraphSpottingModel
 from pcspot.models.no_zones_model import NoZonesSpottingModel
 from pcspot.models.pipeline import stacked_to_batch
+from pcspot.train.cli_common import _parse_zone_grid
 
 
 def _load_output_dir(config_path: Path) -> Path:
@@ -181,6 +182,10 @@ def _resolve_model_kwargs(
     for k, v in overrides.items():
         if v is not None:
             kwargs[k] = v
+    if "zone_grid" in kwargs:
+        # run.json stores the raw "--zone-grid" string (e.g. "6x4"); the
+        # model __init__ expects an (int, int) tuple.
+        kwargs["zone_grid"] = _parse_zone_grid(kwargs["zone_grid"])
     return kwargs
 
 
