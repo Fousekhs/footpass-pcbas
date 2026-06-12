@@ -496,20 +496,18 @@ for the buffer-eviction details.
 
 ### Output schema
 
-Predictions are written as a JSON array, sorted by `(frame, team,
-jersey_number)`:
+Predictions are written as a JSON array of positional rows
+`[frame, team, jersey_number, class_id, score]`, sorted by `(frame,
+team, jersey_number)`:
 
 ```json
 [
-  {
-    "frame": 12345,
-    "team": 0,
-    "jersey_number": 10,
-    "action_class": "Pass",
-    "score": 0.91
-  }
+  [12345, 0, 10, 2, 0.91]
 ]
 ```
+
+`class_id` is the 1-based PCBAS action class id (see `PCBAS_CLASS_NAMES`;
+e.g. `2` = Pass).
 
 ### Build a Codabench submission
 
@@ -518,7 +516,7 @@ Submission packaging is bundled. The writer
 takes a directory of per-half prediction JSON files (the format emitted
 by `scripts/infer.py`) and produces a `submission.zip` containing a
 single `predictions.json` mapping each match id to its flat list of
-predictions:
+prediction rows:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\write_codabench_submission.py `

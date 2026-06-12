@@ -58,7 +58,6 @@ from pcspot.data.loader import (
     _team_of_player,
     load_halves_from_pcbas,
 )
-from pcspot.data.schema import PCBAS_CLASS_NAMES
 from pcspot.data.splits import SplitManifest
 from pcspot.eval.nms import Prediction, decode_predictions, player_centric_nms
 from pcspot.models.graph_model import PlayerCentricSpottingModel
@@ -239,20 +238,21 @@ def _build_jersey_lookup(halves: Iterable[HalfArray]) -> dict[int, int]:
     return lookup
 
 
-def _prediction_to_dict(p: Prediction, jersey_lookup: dict[int, int]) -> dict:
-    return {
-        "frame": int(p.time),
-        "team": _team_of_player(float(p.player_id)),
-        "jersey_number": int(jersey_lookup.get(int(p.player_id), -1)),
-        "action_class": PCBAS_CLASS_NAMES.get(int(p.class_id), str(p.class_id)),
-        "score": float(p.score),
-    }
+def _prediction_to_row(p: Prediction, jersey_lookup: dict[int, int]) -> list:
+    """Positional ``[frame, team, jersey_number, class_id, score]`` row."""
+    return [
+        int(p.time),
+        _team_of_player(float(p.player_id)),
+        int(jersey_lookup.get(int(p.player_id), -1)),
+        int(p.class_id),
+        float(p.score),
+    ]
 
 
 def _write_predictions(out_path: Path, preds: Iterable[Prediction], jersey_lookup: dict[int, int]) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [_prediction_to_dict(p, jersey_lookup) for p in preds]
-    payload.sort(key=lambda x: (x["frame"], x["team"], x["jersey_number"]))
+    payload = [_prediction_to_row(p, jersey_lookup) for p in preds]
+    payload.sort(key=lambda x: (x[0], x[1], x[2]))  # frame, team, jersey_number
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return len(payload)
 
