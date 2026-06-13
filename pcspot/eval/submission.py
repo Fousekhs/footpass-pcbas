@@ -5,12 +5,12 @@ match id to a flat list of player-centric action predictions, where each
 prediction is a positional array::
 
     {
-        "game_01": [
+        "game_01_H1": [
             [1425, 0, 10, 2, 0.87],
             [1580, 1, 4, 7, 0.64],
             ...
         ],
-        "game_02": [...],
+        "game_01_H2": [...],
         ...
     }
 
@@ -227,12 +227,15 @@ def load_internal_predictions(
             f"Predictions file {path} must contain a JSON array of rows"
         )
     inferred_match_id, inferred_half = _infer_from_filename(path)
-    final_match = match_id or inferred_match_id
+    base_match = match_id or inferred_match_id
     final_half = int(half if half is not None else inferred_half)
-    if not final_match:
+    if not base_match:
         raise ValueError(
             f"Could not infer match_id for {path}; pass --match-id explicitly."
         )
+    # The submission keys each match-half separately, matching the
+    # tactical HDF5 keys (e.g. "game_18_H1", "game_18_H2").
+    final_match = f"{base_match}_H{final_half}"
     out: list[InternalPrediction] = []
     for entry in raw:
         if not isinstance(entry, (list, tuple)) or len(entry) != ROW_LEN:
