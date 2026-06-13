@@ -74,9 +74,6 @@ class ValidationTests(unittest.TestCase):
 
     def test_valid_doc_has_no_errors(self) -> None:
         self.assertEqual(validate_match_predictions(self._valid_doc()), [])
-        self.assertEqual(
-            validate_submission_payload({"game_01": self._valid_doc()}), []
-        )
 
     def test_predictions_must_be_a_list(self) -> None:
         errs = validate_match_predictions({"not": "a list"})
@@ -116,15 +113,32 @@ class ValidationTests(unittest.TestCase):
         errs = validate_match_predictions(doc)
         self.assertTrue(any("jersey_number" in e for e in errs))
 
+    def _valid_payload(self) -> dict:
+        events = {"game_01_H1": self._valid_doc()}
+        return {"keys": list(events), "events": events}
+
+    def test_valid_payload_has_no_errors(self) -> None:
+        self.assertEqual(validate_submission_payload(self._valid_payload()), [])
+
     def test_submission_payload_must_be_a_mapping(self) -> None:
         errs = validate_submission_payload(["not", "a", "dict"])
         self.assertTrue(any("must be a dict" in e for e in errs))
 
+    def test_missing_top_level_field_flagged(self) -> None:
+        errs = validate_submission_payload({"events": {}})
+        self.assertTrue(any("'keys'" in e for e in errs))
+
+    def test_keys_events_mismatch_flagged(self) -> None:
+        payload = self._valid_payload()
+        payload["keys"] = ["game_99_H1"]  # does not match events
+        errs = validate_submission_payload(payload)
+        self.assertTrue(any("keys" in e for e in errs))
+
     def test_submission_payload_prefixes_errors_with_match_id(self) -> None:
-        doc = self._valid_doc()
-        doc[0][1] = 2
-        errs = validate_submission_payload({"game_01": doc})
-        self.assertTrue(any(e.startswith("game_01: ") for e in errs))
+        payload = self._valid_payload()
+        payload["events"]["game_01_H1"][0][1] = 2  # bad team
+        errs = validate_submission_payload(payload)
+        self.assertTrue(any(e.startswith("game_01_H1: ") for e in errs))
 
 
 class ZipWriterTests(unittest.TestCase):
@@ -138,14 +152,15 @@ class ZipWriterTests(unittest.TestCase):
             out = Path(tmp) / "submission.zip"
             payload = write_submission_zip(by_match, out)
             self.assertTrue(out.exists())
-            self.assertEqual(sorted(payload.keys()), ["game_01", "game_02"])
+            self.assertEqual(sorted(payload["keys"]), ["game_01", "game_02"])
             with zipfile.ZipFile(out, "r") as zf:
                 self.assertEqual(zf.namelist(), [SUBMISSION_FILE_NAME])
                 doc = json.loads(zf.read(SUBMISSION_FILE_NAME))
-            self.assertEqual(sorted(doc.keys()), ["game_01", "game_02"])
+            self.assertEqual(sorted(doc["keys"]), ["game_01", "game_02"])
+            self.assertEqual(sorted(doc["events"].keys()), ["game_01", "game_02"])
             # Row: [frame, team, jersey_number, class_id, score]
-            self.assertEqual(doc["game_01"][0][2], 10)  # jersey_number
-            self.assertEqual(doc["game_02"][0][3], 7)   # class_id (Tackle)
+            self.assertEqual(doc["events"]["game_01"][0][2], 10)  # jersey_number
+            self.assertEqual(doc["events"]["game_02"][0][3], 7)   # class_id (Tackle)
 
     def test_writer_refuses_invalid_payload(self) -> None:
         # Build a manifestly invalid prediction (out-of-range team) and
@@ -176,7 +191,8 @@ class LoadInternalPredictionsTests(unittest.TestCase):
             )
             preds = load_internal_predictions(path)
             self.assertEqual(len(preds), 1)
-            self.assertEqual(preds[0].match_id, "game_18")
+            # Match key is half-qualified: "<match>_H<half>".
+            self.assertEqual(preds[0].match_id, "game_18_H2")
             self.assertEqual(preds[0].half, 2)
             self.assertEqual(preds[0].team, 0)
             self.assertEqual(preds[0].jersey_number, 10)
@@ -190,7 +206,7 @@ class LoadInternalPredictionsTests(unittest.TestCase):
                 [[0, 1, 4, 7, 0.5]],
             )
             preds = load_internal_predictions(path, match_id="game_99", half=1)
-            self.assertEqual(preds[0].match_id, "game_99")
+            self.assertEqual(preds[0].match_id, "game_99_H1")
             self.assertEqual(preds[0].half, 1)
             self.assertEqual(preds[0].class_id, 7)
 
@@ -221,10 +237,10 @@ class WriteCodabenchSubmissionCliTests(unittest.TestCase):
             self.assertTrue(report.exists())
             with zipfile.ZipFile(out, "r") as zf:
                 doc = json.loads(zf.read(SUBMISSION_FILE_NAME))
-            # Both halves should end up in the same match's prediction
-            # list, ordered by (half, frame, team, jersey_number).
-            class_ids = [row[3] for row in doc["game_01"]]
-            self.assertEqual(class_ids, [2, 3])  # Pass (H1) before Cross (H2)
+            # Each half is keyed separately as "<match>_H<half>".
+            self.assertEqual(sorted(doc["keys"]), ["game_01_H1", "game_01_H2"])
+            self.assertEqual(doc["events"]["game_01_H1"][0][3], 2)  # Pass
+            self.assertEqual(doc["events"]["game_01_H2"][0][3], 3)  # Cross
 
     def test_validate_only_does_not_write_zip(self) -> None:
         import write_codabench_submission as wcs

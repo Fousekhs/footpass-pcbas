@@ -43,7 +43,7 @@ from pcspot.eval.nms import decode_predictions, player_centric_nms
 from pcspot.eval.submission import (
     InternalPrediction,
     SUBMISSION_FILE_NAME,
-    build_match_document,
+    build_submission_document,
     group_predictions_by_match,
     validate_submission_payload,
     write_submission_zip,
@@ -196,9 +196,7 @@ class EndToEndSmokeTests(unittest.TestCase):
             ]
             by_match = group_predictions_by_match(internal)
             self.assertEqual(
-                validate_submission_payload(
-                    {half.match_id: build_match_document(by_match[half.match_id])}
-                ),
+                validate_submission_payload(build_submission_document(by_match)),
                 [],
             )
             zip_path = ckpt_dir / "submission.zip"
@@ -207,7 +205,8 @@ class EndToEndSmokeTests(unittest.TestCase):
             with zipfile.ZipFile(zip_path, "r") as zf:
                 self.assertIn(SUBMISSION_FILE_NAME, zf.namelist())
                 payload = json.loads(zf.read(SUBMISSION_FILE_NAME))
-            self.assertEqual(len(payload[half.match_id]), 1)
+            self.assertEqual(payload["keys"], [half.match_id])
+            self.assertEqual(len(payload["events"][half.match_id]), 1)
 
 
 if __name__ == "__main__":

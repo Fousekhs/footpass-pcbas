@@ -1,17 +1,21 @@
 """PCBAS / FOOTPASS Codabench submission formatting and schema validation.
 
-The Codabench evaluator expects a single JSON document mapping each
-match id to a flat list of player-centric action predictions, where each
+The Codabench evaluator expects a single JSON document with a ``keys``
+list (the match-half ids, in order) and an ``events`` map from each id
+to a flat list of player-centric action predictions, where each
 prediction is a positional array::
 
     {
-        "game_01_H1": [
-            [1425, 0, 10, 2, 0.87],
-            [1580, 1, 4, 7, 0.64],
+        "keys": ["game_01_H1", "game_01_H2", ...],
+        "events": {
+            "game_01_H1": [
+                [1425, 0, 10, 2, 0.87],
+                [1580, 1, 4, 7, 0.64],
+                ...
+            ],
+            "game_01_H2": [...],
             ...
-        ],
-        "game_01_H2": [...],
-        ...
+        }
     }
 
 Each row is ``[frame, team, jersey_number, class_id, score]``:
@@ -102,8 +106,24 @@ def group_predictions_by_match(
 
 
 def build_match_document(preds: Sequence[InternalPrediction]) -> list[list]:
-    """Build the flat list of prediction rows for one match."""
+    """Build the flat list of prediction rows for one match-half."""
     return [prediction_to_payload(p) for p in preds]
+
+
+def build_submission_document(
+    by_match: Mapping[str, Sequence[InternalPrediction]],
+) -> dict:
+    """Build the final ``{"keys": [...], "events": {...}}`` document.
+
+    ``keys`` lists the match-half ids in sorted order; ``events`` maps
+    each id to its flat list of ``[frame, team, jersey_number,
+    class_id, score]`` rows.
+    """
+    events = {
+        str(match_id): build_match_document(by_match[match_id])
+        for match_id in sorted(by_match)
+    }
+    return {"keys": list(events.keys()), "events": events}
 
 
 def validate_match_predictions(preds: object) -> list[str]:
@@ -158,15 +178,32 @@ def validate_match_predictions(preds: object) -> list[str]:
 def validate_submission_payload(payload: Mapping) -> list[str]:
     """Return a list of validation errors (empty == valid).
 
-    ``payload`` is the full ``{match_id: [predictions...]}`` document.
+    ``payload`` is the full ``{"keys": [...], "events": {...}}`` document.
     """
     if not isinstance(payload, Mapping):
-        return ["submission payload must be a dict keyed by match id"]
+        return ["submission payload must be a dict with 'keys' and 'events'"]
 
     errors: list[str] = []
-    for match_id, preds in payload.items():
+    for field in ("keys", "events"):
+        if field not in payload:
+            errors.append(f"missing top-level field {field!r}")
+    if errors:
+        return errors
+
+    keys, events = payload["keys"], payload["events"]
+    if not isinstance(keys, list):
+        errors.append("'keys' must be a list of match-half ids")
+    if not isinstance(events, Mapping):
+        errors.append("'events' must be a dict keyed by match-half id")
+    if errors:
+        return errors
+
+    if set(keys) != set(events.keys()):
+        errors.append("'keys' must list exactly the match-half ids in 'events'")
+
+    for match_id, preds in events.items():
         if not isinstance(match_id, str) or not match_id:
-            errors.append(f"match key {match_id!r} must be a non-empty string")
+            errors.append(f"event key {match_id!r} must be a non-empty string")
             continue
         for err in validate_match_predictions(preds):
             errors.append(f"{match_id}: {err}")
@@ -176,19 +213,17 @@ def validate_submission_payload(payload: Mapping) -> list[str]:
 def write_submission_zip(
     by_match: Mapping[str, Sequence[InternalPrediction]],
     out_path: Path,
-) -> dict[str, list[list]]:
-    """Write the final submission zip and return the payload it contains.
+) -> dict:
+    """Write the final submission zip and return the document it contains.
 
-    The returned dict can be used by tests to assert payload shape
-    without re-reading the zip. The function validates the payload
-    before writing and raises ``ValueError`` if any errors are found.
+    The returned ``{"keys": [...], "events": {...}}`` dict can be used
+    by tests to assert payload shape without re-reading the zip. The
+    function validates the document before writing and raises
+    ``ValueError`` if any errors are found.
     """
-    payload: dict[str, list[list]] = {
-        str(match_id): build_match_document(by_match[match_id])
-        for match_id in sorted(by_match)
-    }
+    doc = build_submission_document(by_match)
 
-    errors = validate_submission_payload(payload)
+    errors = validate_submission_payload(doc)
     if errors:
         raise ValueError(
             "Refusing to write invalid submission: " + "; ".join(errors)
@@ -197,8 +232,8 @@ def write_submission_zip(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(SUBMISSION_FILE_NAME, json.dumps(payload, indent=2, sort_keys=True))
-    return payload
+        zf.writestr(SUBMISSION_FILE_NAME, json.dumps(doc, indent=2))
+    return doc
 
 
 # --------------------------------------------------------------------- loaders

@@ -515,16 +515,20 @@ Submission packaging is bundled. The writer
 [`scripts/write_codabench_submission.py`](scripts/write_codabench_submission.py)
 takes a directory of per-half prediction JSON files (the format emitted
 by `scripts/infer.py`) and produces a `submission.zip` containing a
-single `predictions.json` mapping each match-half (keyed
-`<match>_H<half>`, matching the tactical HDF5 keys) to its flat list of
-prediction rows:
+single `predictions.json`. The document has a `keys` list (the
+match-half ids, keyed `<match>_H<half>` to match the tactical HDF5
+keys) and an `events` map from each id to its flat list of prediction
+rows:
 
 ```json
 {
-  "game_18_H1": [
-    [12345, 0, 10, 2, 0.91]
-  ],
-  "game_18_H2": [ ... ]
+  "keys": ["game_18_H1", "game_18_H2"],
+  "events": {
+    "game_18_H1": [
+      [12345, 0, 10, 2, 0.91]
+    ],
+    "game_18_H2": [ ... ]
+  }
 }
 ```
 
