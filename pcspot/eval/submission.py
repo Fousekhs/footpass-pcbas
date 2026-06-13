@@ -1,22 +1,26 @@
 """PCBAS / FOOTPASS Codabench submission formatting and schema validation.
 
 The Codabench evaluator expects a single JSON document mapping each
-match id to a flat list of player-centric action predictions::
+match id to a flat list of player-centric action predictions, where each
+prediction is a positional array::
 
     {
         "game_01": [
-            {
-                "frame": 1425,
-                "team": 0,
-                "jersey_number": 10,
-                "action_class": "Pass",
-                "score": 0.87
-            },
+            [1425, 0, 10, 2, 0.87],
+            [1580, 1, 4, 7, 0.64],
             ...
         ],
         "game_02": [...],
         ...
     }
+
+Each row is ``[frame, team, jersey_number, class_id, score]``:
+
+- ``frame``        — integer frame index within the match-half
+- ``team``         — 0 or 1
+- ``jersey_number``— shirt number (-1 if unknown)
+- ``class_id``     — 1-based PCBAS action class id (see ``PCBAS_CLASS_NAMES``)
+- ``score``        — confidence in [0, 1]
 
 This module deliberately keeps the conversion logic out of the CLI so
 tests can exercise the schema and grouping without spinning up a full
@@ -40,19 +44,13 @@ from pcspot.data.schema import PCBAS_CLASS_NAMES
 
 SUBMISSION_FILE_NAME = "predictions.json"
 
-# Required per-prediction fields in the final submission schema.
-REQUIRED_PRED_FIELDS: tuple[str, ...] = (
-    "frame",
-    "team",
-    "jersey_number",
-    "action_class",
-    "score",
-)
+# Each prediction is a fixed-length positional row:
+#   [frame, team, jersey_number, class_id, score]
+ROW_LEN = 5
 
-# Valid ``action_class`` values. ``class_id == 0`` ("background") is an
+# Valid ``class_id`` values. ``class_id == 0`` ("background") is an
 # internal decoder sentinel and never appears in submitted predictions.
-_VALID_ACTION_CLASSES = {v for k, v in PCBAS_CLASS_NAMES.items() if k != 0}
-_CLASS_ID_BY_LABEL = {v: k for k, v in PCBAS_CLASS_NAMES.items()}
+_VALID_CLASS_IDS = {k for k in PCBAS_CLASS_NAMES if k != 0}
 
 
 @dataclass(frozen=True)
@@ -73,20 +71,15 @@ class InternalPrediction:
     score: float
 
 
-def _class_label(class_id: int) -> str:
-    """Return the human-readable class name for a 1-based PCBAS class id."""
-    return PCBAS_CLASS_NAMES.get(int(class_id), f"class_{int(class_id)}")
-
-
-def prediction_to_payload(pred: InternalPrediction) -> dict:
-    """Convert an ``InternalPrediction`` to the Codabench dict shape."""
-    return {
-        "frame": int(pred.frame),
-        "team": int(pred.team),
-        "jersey_number": int(pred.jersey_number),
-        "action_class": _class_label(pred.class_id),
-        "score": float(pred.score),
-    }
+def prediction_to_payload(pred: InternalPrediction) -> list:
+    """Convert an ``InternalPrediction`` to the positional row shape."""
+    return [
+        int(pred.frame),
+        int(pred.team),
+        int(pred.jersey_number),
+        int(pred.class_id),
+        float(pred.score),
+    ]
 
 
 def group_predictions_by_match(
@@ -108,8 +101,8 @@ def group_predictions_by_match(
     return by_match
 
 
-def build_match_document(preds: Sequence[InternalPrediction]) -> list[dict]:
-    """Build the flat list of prediction dicts for one match."""
+def build_match_document(preds: Sequence[InternalPrediction]) -> list[list]:
+    """Build the flat list of prediction rows for one match."""
     return [prediction_to_payload(p) for p in preds]
 
 
@@ -120,44 +113,45 @@ def validate_match_predictions(preds: object) -> list[str]:
 
     errors: list[str] = []
     for i, pred in enumerate(preds):
-        if not isinstance(pred, Mapping):
-            errors.append(f"predictions[{i}] must be a dict")
+        if not isinstance(pred, (list, tuple)):
+            errors.append(f"predictions[{i}] must be a list")
             continue
-        for field in REQUIRED_PRED_FIELDS:
-            if field not in pred:
-                errors.append(f"predictions[{i}] missing field {field!r}")
-        if "frame" in pred:
-            try:
-                if int(pred["frame"]) < 0:
-                    errors.append(f"predictions[{i}].frame must be >= 0")
-            except (TypeError, ValueError):
-                errors.append(f"predictions[{i}].frame must be an integer")
-        if "team" in pred:
-            try:
-                if int(pred["team"]) not in (0, 1):
-                    errors.append(
-                        f"predictions[{i}].team {pred['team']!r} must be 0 or 1"
-                    )
-            except (TypeError, ValueError):
-                errors.append(f"predictions[{i}].team must be an integer")
-        if "jersey_number" in pred:
-            try:
-                int(pred["jersey_number"])
-            except (TypeError, ValueError):
-                errors.append(f"predictions[{i}].jersey_number must be an integer")
-        if "action_class" in pred and pred["action_class"] not in _VALID_ACTION_CLASSES:
+        if len(pred) != ROW_LEN:
             errors.append(
-                f"predictions[{i}].action_class {pred['action_class']!r} is not "
-                "a known PCBAS action class"
+                f"predictions[{i}] must have {ROW_LEN} elements "
+                "[frame, team, jersey_number, class_id, score]"
             )
-        if "score" in pred:
-            try:
-                score = float(pred["score"])
-            except (TypeError, ValueError):
-                errors.append(f"predictions[{i}].score must parse as a float")
-            else:
-                if not 0.0 <= score <= 1.0:
-                    errors.append(f"predictions[{i}].score {score} outside [0, 1]")
+            continue
+        frame, team, jersey, class_id, score = pred
+        try:
+            if int(frame) < 0:
+                errors.append(f"predictions[{i}][0] frame must be >= 0")
+        except (TypeError, ValueError):
+            errors.append(f"predictions[{i}][0] frame must be an integer")
+        try:
+            if int(team) not in (0, 1):
+                errors.append(f"predictions[{i}][1] team {team!r} must be 0 or 1")
+        except (TypeError, ValueError):
+            errors.append(f"predictions[{i}][1] team must be an integer")
+        try:
+            int(jersey)
+        except (TypeError, ValueError):
+            errors.append(f"predictions[{i}][2] jersey_number must be an integer")
+        try:
+            if int(class_id) not in _VALID_CLASS_IDS:
+                errors.append(
+                    f"predictions[{i}][3] class_id {class_id!r} is not a known "
+                    "PCBAS class id"
+                )
+        except (TypeError, ValueError):
+            errors.append(f"predictions[{i}][3] class_id must be an integer")
+        try:
+            s = float(score)
+        except (TypeError, ValueError):
+            errors.append(f"predictions[{i}][4] score must parse as a float")
+        else:
+            if not 0.0 <= s <= 1.0:
+                errors.append(f"predictions[{i}][4] score {s} outside [0, 1]")
     return errors
 
 
@@ -182,14 +176,14 @@ def validate_submission_payload(payload: Mapping) -> list[str]:
 def write_submission_zip(
     by_match: Mapping[str, Sequence[InternalPrediction]],
     out_path: Path,
-) -> dict[str, list[dict]]:
+) -> dict[str, list[list]]:
     """Write the final submission zip and return the payload it contains.
 
     The returned dict can be used by tests to assert payload shape
     without re-reading the zip. The function validates the payload
     before writing and raises ``ValueError`` if any errors are found.
     """
-    payload: dict[str, list[dict]] = {
+    payload: dict[str, list[list]] = {
         str(match_id): build_match_document(by_match[match_id])
         for match_id in sorted(by_match)
     }
@@ -218,19 +212,19 @@ def load_internal_predictions(
 ) -> list[InternalPrediction]:
     """Load ``scripts/infer.py``-formatted predictions into the internal form.
 
-    ``infer.py`` writes a list of ``{frame, team, jersey_number,
-    action_class, score}`` dicts. The internal type also needs a
-    ``match_id`` and ``half``; both can be supplied explicitly or
-    inferred from the filename pattern ``<match_id>__<half_id>.json``
-    (where ``half_id`` looks like ``H1`` / ``H2`` or contains a digit).
-    When ``half`` is omitted and the filename has no half segment, the
-    loader defaults to 1.
+    ``infer.py`` writes a list of ``[frame, team, jersey_number,
+    class_id, score]`` rows. The internal type also needs a ``match_id``
+    and ``half``; both can be supplied explicitly or inferred from the
+    filename pattern ``<match_id>__<half_id>.json`` (where ``half_id``
+    looks like ``H1`` / ``H2`` or contains a digit). When ``half`` is
+    omitted and the filename has no half segment, the loader defaults to
+    1.
     """
     path = Path(path)
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ValueError(
-            f"Predictions file {path} must contain a JSON array of dicts"
+            f"Predictions file {path} must contain a JSON array of rows"
         )
     inferred_match_id, inferred_half = _infer_from_filename(path)
     final_match = match_id or inferred_match_id
@@ -241,17 +235,18 @@ def load_internal_predictions(
         )
     out: list[InternalPrediction] = []
     for entry in raw:
-        if not isinstance(entry, Mapping):
+        if not isinstance(entry, (list, tuple)) or len(entry) != ROW_LEN:
             continue
+        frame, team, jersey, class_id, score = entry
         out.append(
             InternalPrediction(
                 match_id=str(final_match),
                 half=final_half,
-                frame=int(entry["frame"]),
-                team=int(entry["team"]),
-                jersey_number=int(entry["jersey_number"]),
-                class_id=_CLASS_ID_BY_LABEL.get(str(entry["action_class"]), 0),
-                score=float(entry["score"]),
+                frame=int(frame),
+                team=int(team),
+                jersey_number=int(jersey),
+                class_id=int(class_id),
+                score=float(score),
             )
         )
     return out
